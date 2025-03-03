@@ -1,0 +1,15 @@
+# Virtual environments
+server/venv/
+client/venv/
+
+# Configuration files with sensitive data
+config/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Docker
+*.log
