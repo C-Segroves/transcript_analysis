@@ -4,6 +4,12 @@ import socket
 import json
 import time
 import os
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 
 # Load database configuration from file
 def load_db_config():
@@ -64,35 +70,58 @@ def mark_task_complete(db_pool, vid_id, model_key):
 
 def main():
     # Initialize database connection pool
-    db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, **DB_CONFIG)
+    try:
+        db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, **DB_CONFIG)
+    except psycopg2.Error as e:
+        logger.error(f"Failed to initialize database pool: {e}")
+        return
 
     clear_assigned_tasks(db_pool)
     
     # Set up socket server
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind(('0.0.0.0', 5000))
-    server_socket.listen(1)
+    try:
+        server_socket.bind(('0.0.0.0', 5000))
+        server_socket.listen(1)
+        logger.info("Server started, waiting for connections...")
+    except socket.error as e:
+        logger.error(f"Socket binding failed: {e}")
+        return
     
-    print("Server started, waiting for connections...")
-    
+   
     while True:
-        client_socket, addr = server_socket.accept()
-        print(f"Connected to {addr}")
-        
-        # Get and send pending task
-        task = get_pending_tasks(db_pool)
-        if task:
-            client_socket.send(json.dumps(task).encode())
+        try:
+            client_socket, addr = server_socket.accept()
+            logger.info(f"Connected to {addr}")
             
-            # Wait for completion response
-            response = json.loads(client_socket.recv(1024).decode())
-            if response.get('packet_type') == 'task_complete':
-                vid_id = response['vid_id']
-                model_key = response['model_key']
-                #mark_task_complete(db_pool, vid_id, model_key)
-                print(f"Task completed for VID_ID: {vid_id}, MODEL_KEY: {model_key}")
+            # Get and send pending task
+            task = get_pending_tasks(db_pool)
+            if task:
+                client_socket.send(json.dumps(task).encode())
+                
+                # Wait for completion response
+                response = json.loads(client_socket.recv(1024).decode())
+                if response.get('packet_type') == 'task_complete':
+                    vid_id = response['vid_id']
+                    model_key = response['model_key']
+                    mark_task_complete(db_pool, vid_id, model_key)
+                    logger.info(f"Task completed for VID_ID: {vid_id}, MODEL_KEY: {model_key}")
+            else:
+                logger.warning("No pending tasks available")
         
-        client_socket.close()
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid response from client {addr}: {e}")
+        except socket.error as e:
+            logger.error(f"Socket error with client {addr}: {e}")
+        except psycopg2.Error as e:
+            logger.error(f"Database error: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error with client {addr}: {e}")
+        finally:
+            try:
+                client_socket.close()
+            except:
+                pass  # Ignore if already closed
 
 if __name__ == "__main__":
     main()
