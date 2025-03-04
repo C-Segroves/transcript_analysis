@@ -10,14 +10,14 @@ from nltk.tokenize import word_tokenize
 
 # Load database configuration from file
 def load_db_config():
-    with open('../config/db_config.json', 'r') as f:
+    with open('config/db_config.json', 'r') as f:
         return json.load(f)
 
 DB_CONFIG = load_db_config()
 
 def load_models():
     print("LOADING NLTK MODELS::")
-    with open('../config/models/models.pkl','rb') as f:
+    with open('config/models/models.pkl','rb') as f:
         model_dict=pickle.load(f)
     print("DONE LOADING NLTK MODELS::")
     return model_dict
