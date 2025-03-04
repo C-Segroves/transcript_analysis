@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # Load database configuration from file
 def load_db_config():
     print(os.listdir('../'))
-    with open('../config/db_config.json', 'r') as f:
+    with open('config/db_config.json', 'r') as f:
         return json.load(f)
 
 DB_CONFIG = load_db_config()

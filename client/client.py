@@ -14,9 +14,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Load database configuration from file
-def load_db_config():
+def load_db_config():    
     try:
-        with open('./config/db_config.json', 'r') as f:
+        with open('config/db_config.json', 'r') as f:
             return json.load(f)
     except FileNotFoundError as e:
         logger.error(f"Database config file not found: {e}")
@@ -30,7 +30,7 @@ DB_CONFIG = load_db_config()
 def load_models():
     try:
         logger.info("LOADING NLTK MODELS::")
-        with open('./config/models/models.pkl', 'rb') as f:
+        with open('config/models/models.pkl', 'rb') as f:
             model_dict = pickle.load(f)
         logger.info("DONE LOADING NLTK MODELS::")
         return model_dict
