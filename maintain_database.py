@@ -278,26 +278,44 @@ def insert_new_transcripts(db_params):
                         cur.execute(insert_query, (vid_id, "No transcript available", -1, 0, "", 0, 0, datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")))
                     conn.commit()
 
-def pull_model_files_dict(model_files_location):
-    with open(model_files_location, 'rb') as f:
-        models = pickle.load(f)
-    return models
-
-def insert_models(db_params, model_files_location):
-    model_dict = pull_model_files_dict(model_files_location)
-
+def insert_initial_vid_model_states(db_params):
+    # Get new VID_IDs with transcripts that lack model states
+    sql_script = """
+    SELECT DISTINCT v.VID_ID
+    FROM VID_TABLE v
+    LEFT JOIN VID_MODEL_STATE vms ON v.VID_ID = vms.VID_ID
+    WHERE vms.VID_ID IS NULL
+    AND EXISTS (SELECT 1 FROM VID_TRANSCRIPT_TABLE vt WHERE vt.VID_ID = v.VID_ID AND vt.START IS NOT NULL);
+    """
+    with psycopg2.connect(**db_params) as conn:
+        vid_ids_df = pd.read_sql_query(sql_script, conn)
+    
+    # Get all MODEL_KEYs
+    model_keys_query = "SELECT MODEL_KEY FROM MODEL_TABLE;"
+    with psycopg2.connect(**db_params) as conn:
+        model_keys_df = pd.read_sql_query(model_keys_query, conn)
+    
+    if vid_ids_df.empty or model_keys_df.empty:
+        print("No new VID_IDs or MODEL_KEYs to process for VID_MODEL_STATE.")
+        return
+    
     insert_query = sql.SQL("""
-    INSERT INTO MODEL_TABLE(MODEL_KEY, MODEL_DATA, INSERT_AT)
-    VALUES (%s, %s, %s)
-    ON CONFLICT (MODEL_KEY) DO NOTHING;
+    INSERT INTO VID_MODEL_STATE(VID_ID, MODEL_KEY, STATE)
+    VALUES (%s, %s, NULL)
+    ON CONFLICT (VID_ID, MODEL_KEY) DO NOTHING;
     """)
     
     with psycopg2.connect(**db_params) as conn:
         with conn.cursor() as cur:
-            for key, value in model_dict.items():
-                print(f"Inserting model {key}")
-                pickle_data = pickle.dumps(value, pickle.HIGHEST_PROTOCOL)
-                cur.execute(insert_query, (key, psycopg2.Binary(pickle_data), datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")))
+            assignments = [
+                (vid_id, model_key)
+                for vid_id in vid_ids_df['vid_id']
+                for model_key in model_keys_df['model_key']
+            ]
+            print(f"Inserting {len(assignments)} initial states into VID_MODEL_STATE.")
+            cur.executemany(insert_query, assignments)
+            conn.commit()
+
 
 def maintain_database(channel_seed_list_location, api_key_path, model_files_location):
     db_params = load_db_params()
@@ -329,13 +347,13 @@ def maintain_database(channel_seed_list_location, api_key_path, model_files_loca
     # Add transcripts (no API key needed here)
     insert_new_transcripts(db_params)
 
-    # Insert models
-    insert_models(db_params, model_files_location)
+    # Add initial states for new VID_IDs with transcripts
+    insert_initial_vid_model_states(db_params)
 
     print("Database maintenance completed.")
 
 if __name__ == "__main__":
     channel_seed_list_location = "config\church channel seed list.csv" 
     api_key_path = "config\YouTube.txt"  
-    model_files_location = "config\models\models.pkl"  
+      
     maintain_database(channel_seed_list_location, api_key_path, model_files_location)

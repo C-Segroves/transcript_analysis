@@ -5,6 +5,7 @@ from psycopg2 import sql
 import json
 import os
 from datetime import datetime
+import pickle
 
 # Load database configuration (assumes a config file or environment variables in Docker)
 # Load database configuration from file
@@ -172,6 +173,27 @@ def create_indexes(db_params):
     for index_query in indexes:
         execute_postgres_script(db_params, index_query)
 
+def pull_model_files_dict(model_files_location):
+    with open(model_files_location, 'rb') as f:
+        models = pickle.load(f)
+    return models
+
+def insert_models(db_params, model_files_location):
+    model_dict = pull_model_files_dict(model_files_location)
+
+    insert_query = sql.SQL("""
+    INSERT INTO MODEL_TABLE(MODEL_KEY, MODEL_DATA, INSERT_AT)
+    VALUES (%s, %s, %s)
+    ON CONFLICT (MODEL_KEY) DO NOTHING;
+    """)
+    
+    with psycopg2.connect(**db_params) as conn:
+        with conn.cursor() as cur:
+            for key, value in model_dict.items():
+                print(f"Inserting model {key}")
+                pickle_data = pickle.dumps(value, pickle.HIGHEST_PROTOCOL)
+                cur.execute(insert_query, (key, psycopg2.Binary(pickle_data), datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")))
+
 def master_database_setup():
     db_params = load_db_params()
     create_channel_table(db_params)
@@ -183,7 +205,11 @@ def master_database_setup():
     create_score_analytics_table(db_params)
     create_assigned_tasks_table(db_params)
 
-    #create_vid_model_state_table(db_params)
+    model_files_location = "config\models\models.pkl"
+    # Insert models
+    insert_models(db_params, model_files_location)
+
+    create_vid_model_state_table(db_params)
     create_indexes(db_params)
     print("Database setup completed.")
 
