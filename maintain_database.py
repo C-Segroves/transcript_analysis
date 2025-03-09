@@ -280,6 +280,7 @@ def insert_new_transcripts(db_params):
 
 def insert_initial_vid_model_states(db_params):
     # Get new VID_IDs with transcripts that lack model states
+    print("Get new VID_IDs with transcripts that lack model states")
     sql_script = """
     SELECT DISTINCT v.VID_ID
     FROM VID_TABLE v
@@ -317,7 +318,7 @@ def insert_initial_vid_model_states(db_params):
             conn.commit()
 
 
-def maintain_database(channel_seed_list_location, api_key_path, model_files_location):
+def maintain_database(channel_seed_list_location, api_key_path):
     db_params = load_db_params()
     api_key = get_api_key(api_key_path)
 
@@ -356,4 +357,4 @@ if __name__ == "__main__":
     channel_seed_list_location = "config\church channel seed list.csv" 
     api_key_path = "config\YouTube.txt"  
       
-    maintain_database(channel_seed_list_location, api_key_path, model_files_location)
+    maintain_database(channel_seed_list_location, api_key_path)

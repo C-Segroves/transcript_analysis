@@ -41,7 +41,7 @@ def load_models():
         logger.error(f"Error loading models.pkl: {e}")
         raise
 
-NLTK_MODELS=load_models()
+NLTK_MODELS = load_models()
 
 def prep_transcript(transcript, n_gram_size):
     try:
@@ -72,7 +72,7 @@ def get_transcript(conn, vid_id, n_gram_size):
 def process_task(transcript_items, model_key, vid_id, n_gram_size):
     try:
         start_time = time.time()
-        model = NLTK_MODELS.get(model_key)  # Use get() to handle missing keys
+        model = NLTK_MODELS.get(model_key)
         if not model:
             raise KeyError(f"Model key {model_key} not found")
         score = [model.score(item, ngram) for item, ngram in transcript_items if ngram]
@@ -93,11 +93,11 @@ def save_results(conn, vid_id, model_key, score, time_taken):
             VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
         """
         cursor.execute(score_query, (vid_id, model_key, score))
-        analytics_query = """
-            INSERT INTO VID_SCORE_ANALYTICS_TABLE (VID_ID, MODEL_KEY, MACHINE_NAME, TIME_TAKEN, INSERT_AT) 
-            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-        """
-        cursor.execute(analytics_query, (vid_id, model_key, socket.gethostname(), time_taken))
+        #analytics_query = """
+        #    INSERT INTO VID_SCORE_ANALYTICS_TABLE (VID_ID, MODEL_KEY, MACHINE_NAME, TIME_TAKEN, INSERT_AT) 
+        #    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+        #"""
+        #cursor.execute(analytics_query, (vid_id, model_key, socket.gethostname(), time_taken))
         conn.commit()
     except psycopg2.Error as e:
         logger.error(f"Database error saving results for VID_ID {vid_id}: {e}")
@@ -117,6 +117,8 @@ def main():
             server_host = os.environ.get('SERVER_HOST', 'localhost')
             client_socket.connect((server_host, 5000))
             
+            # Receive task (may timeout during maintenance)
+            client_socket.settimeout(60)  # Wait up to 60s for a task
             task_data = json.loads(client_socket.recv(1024).decode())
             logger.info(f"Received task: {task_data}")
             if task_data['packet_type'] == 'task_packet':
@@ -139,19 +141,26 @@ def main():
                     }
                     client_socket.send(json.dumps(completion_packet).encode())
                     logger.info(f"Sending completion signal: {completion_packet}")
-        
+            
+            client_socket.close()
+
+        except socket.timeout:
+            logger.info("No task received (server may be in maintenance). Retrying in 60s...")
+            time.sleep(60)  # Wait longer during maintenance
         except socket.error as e:
-            logger.error(f"Socket error: {e}")
+            logger.error(f"Socket error: {e}. Retrying in 60s...")
+            time.sleep(60)
         except json.JSONDecodeError as e:
             logger.error(f"Invalid task data: {e}")
+            time.sleep(5)
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
+            time.sleep(5)
         finally:
             try:
                 client_socket.close()
             except:
                 pass
-            time.sleep(1)  # Prevent tight loop
 
 if __name__ == "__main__":
     main()
