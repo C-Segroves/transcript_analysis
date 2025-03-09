@@ -141,7 +141,7 @@ def main():
                 else:
                     for model_key in model_keys:
                         score, time_taken = process_task(transcript_items, model_key, vid_id, n_gram_size)
-                        logger.info(f"Processed task for VID_ID {vid_id}, MODEL_KEY {model_key}, time taken: {time_taken}")
+                        #logger.info(f"Processed task for VID_ID {vid_id}, MODEL_KEY {model_key}, time taken: {time_taken}")
                         results.append({
                             'model_key': model_key,
                             'score': score,
