@@ -8,11 +8,9 @@ import subprocess
 import os
 import logging
 
-# Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load database configuration from file
 def load_db_config():
     print(os.listdir('../'))
     with open('config/db_config.json', 'r') as f:
@@ -28,7 +26,7 @@ def clear_assigned_tasks(db_pool):
         conn.commit()
         db_pool.putconn(conn)
 
-def get_pending_tasks(db_pool, batch_size=1, n_gram_size=4):
+def get_pending_tasks(db_pool, batch_size=20, n_gram_size=4):
     with db_pool.getconn() as conn:
         cursor = conn.cursor()
         get_vid_id_query = "SELECT VID_ID FROM VID_MODEL_STATE WHERE STATE IS NULL LIMIT 1"
@@ -61,7 +59,7 @@ def get_pending_tasks(db_pool, batch_size=1, n_gram_size=4):
         }
         return pending_task
 
-def mark_task_complete(db_pool, vid_id, model_key):
+def mark_tasks_complete(db_pool, vid_id, results):
     with db_pool.getconn() as conn:
         cursor = conn.cursor()
         update_query = """
@@ -69,14 +67,16 @@ def mark_task_complete(db_pool, vid_id, model_key):
             SET STATE = 'complete'
             WHERE VID_ID = %s AND MODEL_KEY = %s
         """
-        cursor.execute(update_query, (vid_id, model_key))
+        for result in results:
+            model_key = result['model_key']
+            cursor.execute(update_query, (vid_id, model_key))
+            logger.info(f"Task completed for VID_ID: {vid_id}, MODEL_KEY: {model_key}")
         conn.commit()
         db_pool.putconn(conn)
 
 def run_maintenance():
     logger.info("Running maintenance script...")
     try:
-        # Adjust path if maintain_database.py is elsewhere
         result = subprocess.run(
             ["python", "maintain_database.py"],
             check=True,
@@ -92,7 +92,6 @@ def run_maintenance():
         logger.error(f"Unexpected error during maintenance: {e}")
 
 def main():
-    # Initialize database connection pool
     try:
         db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, **DB_CONFIG)
     except psycopg2.Error as e:
@@ -101,7 +100,6 @@ def main():
 
     clear_assigned_tasks(db_pool)
     
-    # Set up socket server
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         server_socket.bind(('0.0.0.0', 5000))
@@ -116,39 +114,58 @@ def main():
         now = datetime.now()
         current_day = now.date()
 
-        # Check if it's after midnight and we haven’t run maintenance today
         if now.hour >= 0 and (last_maintenance_day is None or last_maintenance_day != current_day):
             logger.info("Midnight reached. Stopping task assignment for maintenance.")
             run_maintenance()
-            clear_assigned_tasks(db_pool)  # Reset pending tasks after maintenance
+            clear_assigned_tasks(db_pool)
             last_maintenance_day = current_day
             logger.info("Resuming task assignment post-maintenance.")
-            continue  # Skip to next loop iteration to accept clients
+            continue
 
         try:
             client_socket, addr = server_socket.accept()
             logger.info(f"Connected to {addr}")
+            client_socket.settimeout(60)
             
-            # Get and send pending task
+            # Wait for initial 'ready' packet
+            initial_data = client_socket.recv(1024).decode()
+            initial_packet = json.loads(initial_data)
+            if initial_packet.get('packet_type') != 'ready':
+                logger.warning(f"Unexpected initial packet from {addr}: {initial_packet}")
+                client_socket.close()
+                continue
+            
+            # Send pending task
             task = get_pending_tasks(db_pool)
             if task:
                 client_socket.send(json.dumps(task).encode())
-                
-                # Wait for completion response
-                response = json.loads(client_socket.recv(1024).decode())
-                if response.get('packet_type') == 'task_complete':
-                    vid_id = response['vid_id']
-                    model_key = response['model_key']
-                    mark_task_complete(db_pool, vid_id, model_key)
-                    logger.info(f"Task completed for VID_ID: {vid_id}, MODEL_KEY: {model_key}")
             else:
-                logger.info("No pending tasks available. Waiting for clients...")
-                time.sleep(5)  # Brief pause to avoid tight loop
-            
+                no_task_response = {
+                    'packet_type': 'no_tasks',
+                    'message': 'No pending tasks available at this time.'
+                }
+                client_socket.send(json.dumps(no_task_response).encode())
+                logger.info("No pending tasks available. Sent no_tasks response.")
+                client_socket.close()
+                continue
+
+            # Wait for batch completion
+            response_data = client_socket.recv(4096).decode()  # Larger buffer for batch data
+            response = json.loads(response_data)
+            if response.get('packet_type') == 'batch_complete':
+                vid_id = response['vid_id']
+                results = response['results']
+                mark_tasks_complete(db_pool, vid_id, results)
+                logger.info(f"Batch completed for VID_ID: {vid_id} with {len(results)} models")
+            else:
+                logger.warning(f"Expected batch_complete, got: {response}")
+
             client_socket.close()
 
+        except socket.timeout:
+            logger.info(f"Timeout waiting for client {addr}. Closing connection.")
         except json.JSONDecodeError as e:
-            logger.error(f"Invalid response from client {addr}: {e}")
+            logger.error(f"Invalid JSON from client {addr}: {e}, data: {response_data}")
         except socket.error as e:
             logger.error(f"Socket error with client {addr}: {e}")
         except psycopg2.Error as e:
