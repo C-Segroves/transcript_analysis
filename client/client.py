@@ -130,7 +130,7 @@ def main():
                 
                 for model_key in model_keys:
                     score, time_taken = process_task(transcript_items, model_key, vid_id, n_gram_size)
-                    logger.info(f"Processed task for VID_ID {vid_id}, MODEL_KEY {model_key}, time taken: {time_taken}")
+                    #logger.info(f"Processed task for VID_ID {vid_id}, MODEL_KEY {model_key}, time taken: {time_taken}")
                     save_results(conn, vid_id, model_key, score, time_taken)
                     
                     completion_packet = {
@@ -140,7 +140,9 @@ def main():
                         'n_gram_size': n_gram_size
                     }
                     client_socket.send(json.dumps(completion_packet).encode())
-                    logger.info(f"Sending completion signal: {completion_packet}")
+                    #logger.info(f"Sending completion signal: {completion_packet}")
+                logger.info(f"Processed task for VID_ID {vid_id}")
+
             
             client_socket.close()
 
