@@ -26,7 +26,7 @@ def clear_assigned_tasks(db_pool):
         conn.commit()
         db_pool.putconn(conn)
 
-def get_pending_tasks(db_pool, batch_size=20, n_gram_size=4):
+def get_pending_tasks(db_pool, batch_size=66, n_gram_size=4):
     with db_pool.getconn() as conn:
         cursor = conn.cursor()
         get_vid_id_query = "SELECT VID_ID FROM VID_MODEL_STATE WHERE STATE IS NULL LIMIT 1"
@@ -93,7 +93,7 @@ def run_maintenance():
 
 def main():
     try:
-        db_pool = psycopg2.pool.ThreadedConnectionPool(1, 66, **DB_CONFIG)
+        db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, **DB_CONFIG)
     except psycopg2.Error as e:
         logger.error(f"Failed to initialize database pool: {e}")
         return
