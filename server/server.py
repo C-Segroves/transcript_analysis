@@ -70,7 +70,7 @@ def mark_tasks_complete(db_pool, vid_id, results):
         for result in results:
             model_key = result['model_key']
             cursor.execute(update_query, (vid_id, model_key))
-            logger.info(f"Task completed for VID_ID: {vid_id}, MODEL_KEY: {model_key}")
+            #logger.info(f"Task completed for VID_ID: {vid_id}, MODEL_KEY: {model_key}")
         conn.commit()
         db_pool.putconn(conn)
 
@@ -93,7 +93,7 @@ def run_maintenance():
 
 def main():
     try:
-        db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, **DB_CONFIG)
+        db_pool = psycopg2.pool.ThreadedConnectionPool(1, 66, **DB_CONFIG)
     except psycopg2.Error as e:
         logger.error(f"Failed to initialize database pool: {e}")
         return

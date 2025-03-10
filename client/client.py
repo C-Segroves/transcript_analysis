@@ -7,6 +7,7 @@ import os
 from nltk.util import ngrams, pad_sequence, everygrams
 from nltk.tokenize import word_tokenize
 import logging
+import sys
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -27,8 +28,15 @@ DB_CONFIG = load_db_config()
 def load_models():
     try:
         logger.info("LOADING NLTK MODELS::")
-        with open('config/models/models.pkl', 'rb') as f:
+        file_path = 'config/models/models.pkl'
+        logger.info(f"Checking file existence: {file_path}")
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File {file_path} does not exist")
+        logger.info(f"File size: {os.path.getsize(file_path)} bytes")
+        with open(file_path, 'rb') as f:
+            logger.info("File opened, starting pickle load...")
             model_dict = pickle.load(f)
+            logger.info(f"Loaded {len(model_dict)} models")
         logger.info("DONE LOADING NLTK MODELS::")
         return model_dict
     except FileNotFoundError as e:
@@ -36,6 +44,9 @@ def load_models():
         raise
     except pickle.PickleError as e:
         logger.error(f"Error loading models.pkl: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in load_models: {e}")
         raise
 
 NLTK_MODELS = load_models()
@@ -62,6 +73,11 @@ def get_transcript(conn, vid_id, n_gram_size):
         return prep_transcript(transcript, n_gram_size)
     except psycopg2.Error as e:
         logger.error(f"Database error fetching transcript for VID_ID {vid_id}: {e}")
+        if "current transaction is aborted" in str(e).lower():
+            logger.critical("Transaction aborted detected. Aborting client.")
+            conn.rollback()
+            sys.exit(1)  # Abort the client
+        conn.rollback()  # Reset transaction for retry
         return []
     finally:
         cursor.close()
@@ -88,12 +104,20 @@ def save_results(conn, vid_id, results):
         score_query = """
             INSERT INTO VID_SCORE_TABLE (VID_ID, MODEL_KEY, SCORE, INSERT_AT) 
             VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (VID_ID, MODEL_KEY) 
+            DO UPDATE SET SCORE = EXCLUDED.SCORE, INSERT_AT = CURRENT_TIMESTAMP
         """
         for result in results:
             cursor.execute(score_query, (vid_id, result['model_key'], result['score']))
         conn.commit()
     except psycopg2.Error as e:
         logger.error(f"Database error saving results for VID_ID {vid_id}: {e}")
+        if "current transaction is aborted" in str(e).lower():
+            logger.critical("Transaction aborted detected. Aborting client.")
+            conn.rollback()
+            sys.exit(1)
+        logger.info("Rolling back transaction in save_results")
+        conn.rollback()
     finally:
         cursor.close()
 
