@@ -4,16 +4,14 @@ import json
 import time
 import pickle
 import os
-import multiprocessing as mp
 from nltk.util import ngrams, pad_sequence, everygrams
 from nltk.tokenize import word_tokenize
 import logging
+import sys
 
-# Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load database configuration from file
 def load_db_config():    
     try:
         with open('config/db_config.json', 'r') as f:
@@ -30,8 +28,15 @@ DB_CONFIG = load_db_config()
 def load_models():
     try:
         logger.info("LOADING NLTK MODELS::")
-        with open('config/models/models.pkl', 'rb') as f:
+        file_path = 'config/models/models.pkl'
+        logger.info(f"Checking file existence: {file_path}")
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File {file_path} does not exist")
+        logger.info(f"File size: {os.path.getsize(file_path)} bytes")
+        with open(file_path, 'rb') as f:
+            logger.info("File opened, starting pickle load...")
             model_dict = pickle.load(f)
+            logger.info(f"Loaded {len(model_dict)} models")
         logger.info("DONE LOADING NLTK MODELS::")
         return model_dict
     except FileNotFoundError as e:
@@ -39,6 +44,9 @@ def load_models():
         raise
     except pickle.PickleError as e:
         logger.error(f"Error loading models.pkl: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in load_models: {e}")
         raise
 
 NLTK_MODELS = load_models()
@@ -65,6 +73,11 @@ def get_transcript(conn, vid_id, n_gram_size):
         return prep_transcript(transcript, n_gram_size)
     except psycopg2.Error as e:
         logger.error(f"Database error fetching transcript for VID_ID {vid_id}: {e}")
+        if "current transaction is aborted" in str(e).lower():
+            logger.critical("Transaction aborted detected. Aborting client.")
+            conn.rollback()
+            sys.exit(1)  # Abort the client
+        conn.rollback()  # Reset transaction for retry
         return []
     finally:
         cursor.close()
@@ -85,22 +98,26 @@ def process_task(transcript_items, model_key, vid_id, n_gram_size):
         logger.error(f"Processing error for VID_ID {vid_id}, MODEL_KEY {model_key}: {e}")
         return [], 0
 
-def save_results(conn, vid_id, model_key, score, time_taken):
+def save_results(conn, vid_id, results):
     try:
         cursor = conn.cursor()
         score_query = """
             INSERT INTO VID_SCORE_TABLE (VID_ID, MODEL_KEY, SCORE, INSERT_AT) 
             VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (VID_ID, MODEL_KEY) 
+            DO UPDATE SET SCORE = EXCLUDED.SCORE, INSERT_AT = CURRENT_TIMESTAMP
         """
-        cursor.execute(score_query, (vid_id, model_key, score))
-        #analytics_query = """
-        #    INSERT INTO VID_SCORE_ANALYTICS_TABLE (VID_ID, MODEL_KEY, MACHINE_NAME, TIME_TAKEN, INSERT_AT) 
-        #    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-        #"""
-        #cursor.execute(analytics_query, (vid_id, model_key, socket.gethostname(), time_taken))
+        for result in results:
+            cursor.execute(score_query, (vid_id, result['model_key'], result['score']))
         conn.commit()
     except psycopg2.Error as e:
         logger.error(f"Database error saving results for VID_ID {vid_id}: {e}")
+        if "current transaction is aborted" in str(e).lower():
+            logger.critical("Transaction aborted detected. Aborting client.")
+            conn.rollback()
+            sys.exit(1)
+        logger.info("Rolling back transaction in save_results")
+        conn.rollback()
     finally:
         cursor.close()
 
@@ -116,44 +133,71 @@ def main():
             client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_host = os.environ.get('SERVER_HOST', 'localhost')
             client_socket.connect((server_host, 5000))
-            
-            # Receive task (may timeout during maintenance)
-            client_socket.settimeout(60)  # Wait up to 60s for a task
+            client_socket.settimeout(60)
+
+            # Send initial 'ready' packet
+            ready_packet = {'packet_type': 'ready'}
+            client_socket.send(json.dumps(ready_packet).encode())
+            logger.info("Sent 'ready' packet to server")
+
+            # Receive task
             task_data = json.loads(client_socket.recv(1024).decode())
             logger.info(f"Received task: {task_data}")
+
             if task_data['packet_type'] == 'task_packet':
                 vid_id = task_data['additional_data']['vid_id']
                 n_gram_size = task_data['additional_data']['n_gram_size']
-                transcript = get_transcript(conn, vid_id, n_gram_size)
-                transcript_items = [(item, transcript[j:j+n_gram_size-1]) for j, item in enumerate(transcript[n_gram_size-1:]) if j + n_gram_size - 1 < len(transcript)]
                 model_keys = task_data['additional_data']['model_keys']
                 
-                for model_key in model_keys:
-                    score, time_taken = process_task(transcript_items, model_key, vid_id, n_gram_size)
-                    #logger.info(f"Processed task for VID_ID {vid_id}, MODEL_KEY {model_key}, time taken: {time_taken}")
-                    save_results(conn, vid_id, model_key, score, time_taken)
-                    
-                    completion_packet = {
-                        'packet_type': 'task_complete',
-                        'vid_id': vid_id,
-                        'model_key': model_key,
-                        'n_gram_size': n_gram_size
-                    }
-                    client_socket.send(json.dumps(completion_packet).encode())
-                    #logger.info(f"Sending completion signal: {completion_packet}")
-                logger.info(f"Processed task for VID_ID {vid_id}")
+                transcript = get_transcript(conn, vid_id, n_gram_size)
+                transcript_items = [(item, transcript[j:j+n_gram_size-1]) for j, item in enumerate(transcript[n_gram_size-1:]) if j + n_gram_size - 1 < len(transcript)]
 
-            
+                # Process all models and collect results
+                results = []
+                if not transcript_items:  # Handle empty transcript
+                    logger.info(f"No transcript found for VID_ID {vid_id}. Assigning empty scores.")
+                    for model_key in model_keys:
+                        results.append({
+                            'model_key': model_key,
+                            'score': [],  # Empty list for no transcript
+                            'time_taken': 0
+                        })
+                else:
+                    for model_key in model_keys:
+                        score, time_taken = process_task(transcript_items, model_key, vid_id, n_gram_size)
+                        #logger.info(f"Processed task for VID_ID {vid_id}, MODEL_KEY {model_key}, time taken: {time_taken}")
+                        results.append({
+                            'model_key': model_key,
+                            'score': score,
+                            'time_taken': time_taken
+                        })
+
+                # Save all results to database
+                save_results(conn, vid_id, results)
+
+                # Send single batch_complete packet
+                batch_complete_packet = {
+                    'packet_type': 'batch_complete',
+                    'vid_id': vid_id,
+                    'results': [{'model_key': r['model_key']} for r in results]  # Server only needs model_keys
+                }
+                client_socket.send(json.dumps(batch_complete_packet).encode())
+                logger.info(f"Sent batch_complete for VID_ID {vid_id} with {len(results)} models")
+
+            elif task_data['packet_type'] == 'no_tasks':
+                logger.info("No tasks available from server. Waiting 60s...")
+                time.sleep(60)
+
             client_socket.close()
 
         except socket.timeout:
             logger.info("No task received (server may be in maintenance). Retrying in 60s...")
-            time.sleep(60)  # Wait longer during maintenance
+            time.sleep(60)
         except socket.error as e:
             logger.error(f"Socket error: {e}. Retrying in 60s...")
             time.sleep(60)
         except json.JSONDecodeError as e:
-            logger.error(f"Invalid task data: {e}")
+            logger.error(f"Invalid task data: {e}. Retrying in 5s...")
             time.sleep(5)
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
