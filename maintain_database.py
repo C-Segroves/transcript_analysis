@@ -1,5 +1,3 @@
-# maintain_database.py
-
 import psycopg2
 from psycopg2 import sql
 import pandas as pd
@@ -9,22 +7,21 @@ import time
 from datetime import datetime
 import re
 from youtube_transcript_api import YouTubeTranscriptApi
-import pickle
 import os
+import logging
 
-# Load database configuration (assumes Docker environment variables)
+# Logging is configured in server.py, so we'll rely on it being passed or set up there
+logger = logging.getLogger(__name__)
 
 # Load database configuration from file
 def load_db_config():
-    print(os.listdir('../'))
     with open('config/db_config.json', 'r') as f:
         return json.load(f)
 
 def load_db_params():
-    db_params = load_db_config()
-    return db_params
+    return load_db_config()
 
-# Load API key from environment or file
+# Load API key from file
 def get_api_key(api_key_path=None):
     if api_key_path and os.path.exists(api_key_path):
         with open(api_key_path, 'r') as f:
@@ -37,57 +34,6 @@ def execute_query(db_params, query, params=None):
             cur.execute(query, params or ())
             conn.commit()
             return cur
-
-def get_channel_seed_df(channel_seed_list_location):
-    channel_seed_df = pd.read_csv(channel_seed_list_location)
-    channel_seed_df['channel_handle'] = channel_seed_df['channel_url'].apply(lambda x: x.split('@')[1])
-    return channel_seed_df
-
-def get_current_channels(db_params):
-    sql_script = """
-    SELECT CHANNEL_HANDLE, CHANNEL_ID FROM CHANNEL_TABLE;
-    """
-    with psycopg2.connect(**db_params) as conn:
-        return pd.read_sql_query(sql_script, conn)
-
-def get_channel_id_from_seed_list(channel_seed_df, api_key, db_params):
-    current_channels_df = get_current_channels(db_params)
-    channel_seed_df = channel_seed_df.loc[~channel_seed_df['channel_handle'].isin(current_channels_df['channel_handle'])]
-
-    channel_handle, channel_id, channel_snippet = [], [], []
-    for index, row in channel_seed_df.iterrows():
-        time.sleep(0.25)
-        try:
-            row_channel_handle = row['channel_handle']
-            url = f'https://www.googleapis.com/youtube/v3/channels?key={api_key}&forHandle={row_channel_handle}'
-            with urllib.request.urlopen(url, timeout=1) as response:
-                resp = json.load(response)
-                row_channel_id = resp['items'][0]['id']
-
-            channel_url = f'https://www.googleapis.com/youtube/v3/channels?key={api_key}&id={row_channel_id}&part=snippet'
-            with urllib.request.urlopen(channel_url, timeout=1) as response:
-                resp2 = json.load(response)
-                snippet = resp2['items'][0]['snippet']
-
-            channel_handle.append(row_channel_handle)
-            channel_id.append(row_channel_id)
-            channel_snippet.append(snippet)
-        except Exception as e:
-            print(f"Error fetching channel {row_channel_handle}: {e}")
-            break
-    
-    return pd.DataFrame({'channel_handle': channel_handle, 'channel_id': channel_id, 'channel_snippet': channel_snippet})
-
-def insert_new_channels_into_channel_table(new_channels_df, db_params):
-    insert_query = sql.SQL("""
-    INSERT INTO CHANNEL_TABLE(CHANNEL_HANDLE, CHANNEL_ID, CHANNEL_SNIPPET, INSERT_AT)
-    VALUES (%s, %s, %s, %s)
-    ON CONFLICT (CHANNEL_ID) DO NOTHING;
-    """)
-    with psycopg2.connect(**db_params) as conn:
-        with conn.cursor() as cur:
-            for _, row in new_channels_df.iterrows():
-                cur.execute(insert_query, (row['channel_handle'], row['channel_id'], json.dumps(row['channel_snippet']), datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")))
 
 def get_vid_json_list_from_channel(channel_id, after_date, api_key):
     if after_date is None:
@@ -109,10 +55,10 @@ def get_vid_json_list_from_channel(channel_id, after_date, api_key):
                     break
         except urllib.error.HTTPError as e:
             if e.code == 403:
-                print(f"HTTP 403 Forbidden for {channel_id}. Likely API quota exhausted.")
-                raise Exception("API quota likely exhausted (HTTP 403).")  # Signal to quit
+                logger.error(f"HTTP 403 Forbidden for {channel_id}. Likely API quota exhausted.")
+                raise Exception("API quota likely exhausted (HTTP 403).")
             else:
-                print(f"Error fetching videos for {channel_id}: {e}")
+                logger.error(f"Error fetching videos for {channel_id}: {e}")
                 break
     return vid_json_list
 
@@ -143,7 +89,7 @@ def insert_vid_data_for_new_channels(db_params, api_key):
     with psycopg2.connect(**db_params) as conn:
         with conn.cursor() as cur:
             for channel_id in channel_id_df['channel_id']:
-                print(f"Processing video data for {channel_id}")
+                logger.info(f"Processing video data for new channel {channel_id}")
                 try:
                     test_vid_list = get_vid_json_list_from_channel(channel_id, None, api_key)
                     for page in test_vid_list:
@@ -160,11 +106,11 @@ def insert_vid_data_for_new_channels(db_params, api_key):
                                 cur.execute(insert_query_vid_data, (vid_id, title, description, publishtime, json.dumps(snippet), insert_time))
                     conn.commit()
                 except Exception as e:
-                    print(f"Error pulling data for {channel_id}: {e}")
+                    logger.error(f"Error pulling data for {channel_id}: {e}")
                     if "API quota likely exhausted" in str(e):
-                        print("Stopping video data collection due to quota limit.")
-                        conn.commit()  # Save what we’ve got
-                        raise  # Re-raise to exit the function
+                        logger.info("Stopping video data collection due to quota limit.")
+                        conn.commit()
+                        raise
                     conn.rollback()
 
 def get_date_of_last_vid_by_channel_df(db_params):
@@ -203,10 +149,9 @@ def insert_new_vid_data_for_current_channels(db_params, api_key):
         with conn.cursor() as cur:
             for _, row in vid_tab_df.iterrows():
                 channel_id = row['channel_id']
-                latest_date = row['publishtime']  # lowercase from SQL query
-                print(f"Processing new video data for {channel_id}")
+                latest_date = row['publishtime']
+                logger.info(f"Processing new video data for existing channel {channel_id}")
                 try:
-                    # Convert to RFC 3339 format (e.g., "2025-03-06T10:26:40Z")
                     if isinstance(latest_date, str):
                         latest_date = datetime.strptime(latest_date, "%Y-%m-%d %H:%M:%S")
                     latest_date_rfc3339 = latest_date.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -225,9 +170,9 @@ def insert_new_vid_data_for_current_channels(db_params, api_key):
                                 cur.execute(insert_query_vid_data, (vid_id, title, description, publishtime, json.dumps(snippet), insert_time))
                     conn.commit()
                 except Exception as e:
-                    print(f"Error for {channel_id}: {e}")
+                    logger.error(f"Error for {channel_id}: {e}")
                     if "API quota likely exhausted" in str(e):
-                        print("Stopping video updates due to quota limit.")
+                        logger.info("Stopping video updates due to quota limit.")
                         conn.commit()
                         raise
                     conn.rollback()
@@ -253,7 +198,7 @@ def insert_new_transcripts(db_params):
     with psycopg2.connect(**db_params) as conn:
         with conn.cursor() as cur:
             for vid_id in needed_transcript_vid_id_df['vid_id']:
-                print(f"Processing transcript for {vid_id}")
+                logger.info(f"Processing transcript for {vid_id}")
                 try:
                     time.sleep(0.125)
                     transcript_info_list = YouTubeTranscriptApi.get_transcript(vid_id)
@@ -270,8 +215,7 @@ def insert_new_transcripts(db_params):
                         cur.execute(insert_query, (vid_id, text, start, duration, text_formatted, word_count, cum_word_count, datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")))
                     conn.commit()
                 except Exception as e:
-                    print(f"Error for {vid_id}: {e}")
-                    # Insert single "no transcript" row with START = -1 only if no rows exist
+                    logger.error(f"Error for {vid_id}: {e}")
                     cur.execute("SELECT COUNT(*) FROM VID_TRANSCRIPT_TABLE WHERE VID_ID = %s", (vid_id,))
                     row_count = cur.fetchone()[0]
                     if row_count == 0:
@@ -279,8 +223,7 @@ def insert_new_transcripts(db_params):
                     conn.commit()
 
 def insert_initial_vid_model_states(db_params):
-    # Get new VID_IDs with transcripts that lack model states
-    print("Get new VID_IDs with transcripts that lack model states")
+    logger.info("Getting new VID_IDs with transcripts that lack model states")
     sql_script = """
     SELECT DISTINCT v.VID_ID
     FROM VID_TABLE v
@@ -291,13 +234,12 @@ def insert_initial_vid_model_states(db_params):
     with psycopg2.connect(**db_params) as conn:
         vid_ids_df = pd.read_sql_query(sql_script, conn)
     
-    # Get all MODEL_KEYs
     model_keys_query = "SELECT MODEL_KEY FROM MODEL_TABLE;"
     with psycopg2.connect(**db_params) as conn:
         model_keys_df = pd.read_sql_query(model_keys_query, conn)
     
     if vid_ids_df.empty or model_keys_df.empty:
-        print("No new VID_IDs or MODEL_KEYs to process for VID_MODEL_STATE.")
+        logger.info("No new VID_IDs or MODEL_KEYs to process for VID_MODEL_STATE.")
         return
     
     insert_query = sql.SQL("""
@@ -313,48 +255,40 @@ def insert_initial_vid_model_states(db_params):
                 for vid_id in vid_ids_df['vid_id']
                 for model_key in model_keys_df['model_key']
             ]
-            print(f"Inserting {len(assignments)} initial states into VID_MODEL_STATE.")
+            logger.info(f"Inserting {len(assignments)} initial states into VID_MODEL_STATE.")
             cur.executemany(insert_query, assignments)
             conn.commit()
 
-
-def maintain_database(channel_seed_list_location, api_key_path):
+def maintain_database(api_key_path):
     db_params = load_db_params()
     api_key = get_api_key(api_key_path)
-
-    # Add new channels
-    channel_seed_df = get_channel_seed_df(channel_seed_list_location)
-    new_channels_df = get_channel_id_from_seed_list(channel_seed_df, api_key, db_params)
-    insert_new_channels_into_channel_table(new_channels_df, db_params)
 
     # Add video data for new channels, quit on 403
     try:
         insert_vid_data_for_new_channels(db_params, api_key)
     except Exception as e:
         if "API quota likely exhausted" in str(e):
-            print("Quota exhausted. Skipping further API calls and moving to transcripts.")
+            logger.info("Quota exhausted. Skipping further API calls and moving to transcripts.")
         else:
-            raise  # Re-raise unexpected errors
+            raise
 
-    # Skip new video data for current channels if quota is hit
+    # Update video data for existing channels
     try:
         insert_new_vid_data_for_current_channels(db_params, api_key)
     except Exception as e:
         if "API quota likely exhausted" in str(e):
-            print("Quota exhausted. Skipping further API calls and moving to transcripts.")
+            logger.info("Quota exhausted. Skipping further API calls and moving to transcripts.")
         else:
             raise
 
-    # Add transcripts (no API key needed here)
+    # Add transcripts
     insert_new_transcripts(db_params)
 
     # Add initial states for new VID_IDs with transcripts
     insert_initial_vid_model_states(db_params)
 
-    print("Database maintenance completed.")
+    logger.info("Database maintenance completed.")
 
 if __name__ == "__main__":
-    channel_seed_list_location = "config\church channel seed list.csv" 
-    api_key_path = "config\YouTube.txt"  
-      
-    maintain_database(channel_seed_list_location, api_key_path)
+    api_key_path = "config/YouTube.txt"
+    maintain_database(api_key_path)

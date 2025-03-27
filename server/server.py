@@ -7,12 +7,12 @@ from datetime import datetime
 import subprocess
 import os
 import logging
+from maintain_database import maintain_database
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def load_db_config():
-    print(os.listdir('../'))
     with open('config/db_config.json', 'r') as f:
         return json.load(f)
 
@@ -74,20 +74,11 @@ def mark_tasks_complete(db_pool, vid_id, results):
         conn.commit()
         db_pool.putconn(conn)
 
-def run_maintenance():
+def run_maintenance( api_key_path):
     logger.info("Running maintenance script...")
     try:
-        result = subprocess.run(
-            ["python", "maintain_database.py"],
-            check=True,
-            capture_output=True,
-            text=True
-        )
+        maintain_database(api_key_path)
         logger.info("Maintenance completed successfully.")
-        logger.debug(f"Maintenance output: {result.stdout}")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Maintenance failed: {e}")
-        logger.error(f"Error output: {e.stderr}")
     except Exception as e:
         logger.error(f"Unexpected error during maintenance: {e}")
 
@@ -116,7 +107,7 @@ def main():
 
         if now.hour >= 0 and (last_maintenance_day is None or last_maintenance_day != current_day):
             logger.info("Midnight reached. Stopping task assignment for maintenance.")
-            run_maintenance()
+            run_maintenance("/app/config/YouTube.txt")
             clear_assigned_tasks(db_pool)
             last_maintenance_day = current_day
             logger.info("Resuming task assignment post-maintenance.")
