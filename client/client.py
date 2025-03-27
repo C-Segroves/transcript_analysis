@@ -76,8 +76,8 @@ def get_transcript(conn, vid_id, n_gram_size):
         if "current transaction is aborted" in str(e).lower():
             logger.critical("Transaction aborted detected. Aborting client.")
             conn.rollback()
-            sys.exit(1)  # Abort the client
-        conn.rollback()  # Reset transaction for retry
+            sys.exit(1)
+        conn.rollback()
         return []
     finally:
         cursor.close()
@@ -111,7 +111,7 @@ def save_results(conn, vid_id, results):
             cursor.execute(score_query, (vid_id, result['model_key'], result['score']))
         conn.commit()
     except psycopg2.Error as e:
-        logger.error(f"Database error saving results for VID_ID {vid_id}: {e}")
+        logger.error(f"Database error saving results for VID_ID {vid_id}: {e}")  # Fixed here
         if "current transaction is aborted" in str(e).lower():
             logger.critical("Transaction aborted detected. Aborting client.")
             conn.rollback()
@@ -120,6 +120,15 @@ def save_results(conn, vid_id, results):
         conn.rollback()
     finally:
         cursor.close()
+
+def recv_all(socket, buffer_size=4096):
+    data = b""
+    while True:
+        part = socket.recv(buffer_size)
+        data += part
+        if len(part) < buffer_size:
+            break
+    return data.decode()
 
 def main():
     try:
@@ -141,7 +150,7 @@ def main():
             logger.info("Sent 'ready' packet to server")
 
             # Receive task
-            task_data = json.loads(client_socket.recv(1024).decode())
+            task_data = json.loads(recv_all(client_socket, 4096))
             logger.info(f"Received task: {task_data}")
 
             if task_data['packet_type'] == 'task_packet':
@@ -154,18 +163,17 @@ def main():
 
                 # Process all models and collect results
                 results = []
-                if not transcript_items:  # Handle empty transcript
+                if not transcript_items:
                     logger.info(f"No transcript found for VID_ID {vid_id}. Assigning empty scores.")
                     for model_key in model_keys:
                         results.append({
                             'model_key': model_key,
-                            'score': [],  # Empty list for no transcript
+                            'score': [],
                             'time_taken': 0
                         })
                 else:
                     for model_key in model_keys:
                         score, time_taken = process_task(transcript_items, model_key, vid_id, n_gram_size)
-                        #logger.info(f"Processed task for VID_ID {vid_id}, MODEL_KEY {model_key}, time taken: {time_taken}")
                         results.append({
                             'model_key': model_key,
                             'score': score,
@@ -179,7 +187,7 @@ def main():
                 batch_complete_packet = {
                     'packet_type': 'batch_complete',
                     'vid_id': vid_id,
-                    'results': [{'model_key': r['model_key']} for r in results]  # Server only needs model_keys
+                    'results': [{'model_key': r['model_key']} for r in results]
                 }
                 client_socket.send(json.dumps(batch_complete_packet).encode())
                 logger.info(f"Sent batch_complete for VID_ID {vid_id} with {len(results)} models")
@@ -199,6 +207,7 @@ def main():
         except json.JSONDecodeError as e:
             logger.error(f"Invalid task data: {e}. Retrying in 5s...")
             time.sleep(5)
+            continue
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
             time.sleep(5)
