@@ -2,12 +2,12 @@ import psycopg2
 import socket
 import json
 import time
-import pickle
 import os
 from nltk.util import ngrams, pad_sequence, everygrams
 from nltk.tokenize import word_tokenize
 import logging
 import sys
+import pickle
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -25,31 +25,67 @@ def load_db_config():
 
 DB_CONFIG = load_db_config()
 
-def load_models():
-    try:
-        logger.info("LOADING NLTK MODELS::")
-        file_path = 'config/models/models.pkl'
-        logger.info(f"Checking file existence: {file_path}")
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"File {file_path} does not exist")
-        logger.info(f"File size: {os.path.getsize(file_path)} bytes")
-        with open(file_path, 'rb') as f:
-            logger.info("File opened, starting pickle load...")
-            model_dict = pickle.load(f)
-            logger.info(f"Loaded {len(model_dict)} models")
-        logger.info("DONE LOADING NLTK MODELS::")
-        return model_dict
-    except FileNotFoundError as e:
-        logger.error(f"Models file not found: {e}")
-        raise
-    except pickle.PickleError as e:
-        logger.error(f"Error loading models.pkl: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in load_models: {e}")
-        raise
+# Initialize an empty dictionary for NLTK models
+NLTK_MODELS = {}
 
-NLTK_MODELS = load_models()
+def load_model_from_db(conn, model_key):
+    """Load a specific model from the model_table in PostgreSQL with error handling."""
+    try:
+        cursor = conn.cursor()
+        query = """
+            SELECT model_data 
+            FROM model_table 
+            WHERE model_key = %s
+        """
+        cursor.execute(query, (model_key,))
+        result = cursor.fetchone()
+        
+        if result is None:
+            logger.error(f"Model key {model_key} not found in model_table")
+            return None
+        
+        # Get model_data and convert memoryview to bytes if necessary
+        model_data = result[0]
+        if isinstance(model_data, memoryview):
+            model_data = model_data.tobytes()
+            logger.info(f"Converted memoryview to bytes for {model_key}")
+        elif not isinstance(model_data, bytes):
+            logger.error(f"Model data for {model_key} is not bytes or memoryview: {type(model_data)}")
+            return None
+        
+        if not model_data:
+            logger.error(f"Model data for {model_key} is empty")
+            return None
+        
+        # Deserialize the model
+        model = pickle.loads(model_data)
+        if model is None:
+            logger.error(f"Deserialized model for {model_key} is None")
+            return None
+        
+        # Verify it’s an NLTK model with a score method
+        if not hasattr(model, 'score'):
+            logger.error(f"Deserialized object for {model_key} is not an NLTK model (no 'score' method): {type(model)}")
+            return None
+        
+        logger.info(f"Successfully loaded NLTK model {model_key} from database. Type: {type(model)}")
+        return model
+    
+    except psycopg2.Error as e:
+        logger.error(f"Database error fetching model {model_key}: {e}")
+        conn.rollback()
+        return None
+    except pickle.PickleError as e:
+        logger.error(f"Pickle deserialization error for model {model_key}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error loading model {model_key}: {e}")
+        return None
+    finally:
+        try:
+            cursor.close()
+        except:
+            pass
 
 def prep_transcript(transcript, n_gram_size):
     try:
@@ -82,18 +118,22 @@ def get_transcript(conn, vid_id, n_gram_size):
     finally:
         cursor.close()
 
-def process_task(transcript_items, model_key, vid_id, n_gram_size):
+def process_task(conn, transcript_items, model_key, vid_id, n_gram_size):
     try:
         start_time = time.time()
-        model = NLTK_MODELS.get(model_key)
-        if not model:
-            raise KeyError(f"Model key {model_key} not found")
+        
+        # Check if the model is already in NLTK_MODELS, if not, attempt to load it
+        if model_key not in NLTK_MODELS:
+            model = load_model_from_db(conn, model_key)
+            if model is None:
+                logger.error(f"Skipping processing for model {model_key} due to load failure")
+                return [], 0
+            NLTK_MODELS[model_key] = model
+        
+        model = NLTK_MODELS[model_key]
         score = [model.score(item, ngram) for item, ngram in transcript_items if ngram]
         time_taken = time.time() - start_time
         return score, time_taken
-    except KeyError as e:
-        logger.error(f"Model error: {e}")
-        return [], 0
     except Exception as e:
         logger.error(f"Processing error for VID_ID {vid_id}, MODEL_KEY {model_key}: {e}")
         return [], 0
@@ -111,7 +151,7 @@ def save_results(conn, vid_id, results):
             cursor.execute(score_query, (vid_id, result['model_key'], result['score']))
         conn.commit()
     except psycopg2.Error as e:
-        logger.error(f"Database error saving results for VID_ID {vid_id}: {e}")  # Fixed here
+        logger.error(f"Database error saving results for VID_ID {vid_id}: {e}")
         if "current transaction is aborted" in str(e).lower():
             logger.critical("Transaction aborted detected. Aborting client.")
             conn.rollback()
@@ -173,7 +213,7 @@ def main():
                         })
                 else:
                     for model_key in model_keys:
-                        score, time_taken = process_task(transcript_items, model_key, vid_id, n_gram_size)
+                        score, time_taken = process_task(conn, transcript_items, model_key, vid_id, n_gram_size)
                         results.append({
                             'model_key': model_key,
                             'score': score,
