@@ -1,22 +1,29 @@
 import psycopg2
 from psycopg2 import pool
-import socket
+import asyncio
 import json
-import time
 from datetime import datetime
-import subprocess
-import os
 import logging
 from maintain_database import maintain_database
+from packet_handler.packet_handler import send_packet, receive_packet
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+task_queue = []
+assigned_tasks = set()
+task_lock = asyncio.Lock()
+MAX_CLIENTS = 10
+client_semaphore = asyncio.Semaphore(MAX_CLIENTS)
 
 def load_db_config():
     with open('config/db_config.json', 'r') as f:
         return json.load(f)
 
 DB_CONFIG = load_db_config()
+db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, **DB_CONFIG)  # Global pool
+
 
 def clear_assigned_tasks(db_pool):
     with db_pool.getconn() as conn:
@@ -74,100 +81,111 @@ def mark_tasks_complete(db_pool, vid_id, results):
         conn.commit()
         db_pool.putconn(conn)
 
-def run_maintenance( api_key_path):
-    logger.info("Running maintenance script...")
-    try:
-        maintain_database(api_key_path)
-        logger.info("Maintenance completed successfully.")
-    except Exception as e:
-        logger.error(f"Unexpected error during maintenance: {e}")
+async def run_maintenance( api_key_path):
+    while True:
+        now = datetime.utcnow()
+        logger.info(f'Time is::{now.hour}:{now.minute}')
+        if now.hour == 0 and now.minute == 0:  # Reverted to midnight UTC
+            logger.info("Midnight reached. Stopping task assignment for maintenance.")
+            logger.info("Running maintenance script...")
+            try:
+                await asyncio.to_thread(maintain_database, api_key_path, logger)
+            except Exception as e:
+                logger.error(f"Maintenance failed: {e}")
+            await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
-def main():
+async def reload_task_queue(db_pool, batch_size=66, n_gram_size=4,target_amount=20):
+    logger.info(f'Attempting to reload task queue.')
+    for _ in range(target_amount):
+        task_packet=get_pending_tasks(db_pool, batch_size, n_gram_size)
+        task_queue.append(task_packet)
+        if not task_packet:
+            break
+
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    addr = writer.get_extra_info('peername')
+    logger.info(f"Connection from {addr}")
+    
+    async with client_semaphore:
+        try:
+            while True:
+                packet = await receive_packet(reader, writer, logger=logger)  # Pass writer
+                if packet.get('packet_type') != 'ready':
+                    logger.error(f"Expected 'ready' packet from {addr}, got {packet}")
+                    return
+                
+                logger.info(f"Received 'ready' from {addr}")
+                
+                async with task_lock:
+                    if len(task_queue)==0:
+                        no_tasks_packet = {'packet_type': 'no_tasks'}
+                        
+                        await send_packet(writer, no_tasks_packet, reader, logger=logger)
+                        logger.info(f"Sent 'no_tasks' to {addr} : {datetime.now().hour}")
+                        if len(task_queue) < 10:
+                            await reload_task_queue(db_pool, batch_size=66, n_gram_size=4,target_amount=20)
+                        task_queue_size=len(task_queue)
+                        logger.info(f'task_queue is now of size: {task_queue_size}')
+                    elif datetime.now().hour == 0:
+                        no_tasks_packet = {'packet_type': 'no_tasks'}
+                        
+                        await send_packet(writer, no_tasks_packet, reader, logger=logger)
+                        logger.info(f"Sent 'wait for maintanance' to {addr} : {datetime.now().hour} ")
+                    else:
+                        task_packet = task_queue.pop(0)
+                        """task_packet = {
+                            'packet_type': 'task_packet',
+                            'additional_data': task
+                        }"""
+                        await send_packet(writer, task_packet, reader, logger=logger)
+                        logger.info(f"Sent task {task_packet['additional_data']['vid_id']} to {addr}")
+                        assigned_tasks.add(task_packet['additional_data']['vid_id'])
+                        
+                        result_packet = await receive_packet(reader, writer, logger=logger)  # Pass writer
+                        if result_packet.get('packet_type') == 'batch_complete':
+                            logger.info(f"Received batch_complete for {result_packet['vid_id']} from {addr}")
+                            await asyncio.to_thread(mark_tasks_complete, db_pool, result_packet['vid_id'], result_packet['results'])
+                            assigned_tasks.discard(result_packet['vid_id'])
+                        else:
+                            logger.error(f"Expected 'batch_complete', got {result_packet}")
+                logger.info(f'Attempting to restart com loop with client {addr}.')
+        
+        except Exception as e:
+            logger.error(f"Error handling client {addr}: {e}")
+        finally:
+            logger.info(f"Closing connection from {addr}")
+            writer.close()
+            await writer.wait_closed()
+
+async def main():
     try:
         db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, **DB_CONFIG)
     except psycopg2.Error as e:
         logger.error(f"Failed to initialize database pool: {e}")
         return
-
-    clear_assigned_tasks(db_pool)
-    
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        server_socket.bind(('0.0.0.0', 5000))
-        server_socket.listen(1)
-        logger.info("Server started, waiting for connections...")
-    except socket.error as e:
-        logger.error(f"Socket binding failed: {e}")
+        clear_assigned_tasks(db_pool)
+    except Exception as e:
+        logger.error(f'Failed to clear assigned tasks:{e}')
         return
     
-    last_maintenance_day = None
-    while True:
-        now = datetime.now()
-        current_day = now.date()
+    if len(task_queue) < 10:
+        await reload_task_queue(db_pool, batch_size=66, n_gram_size=4,target_amount=20)
 
-        if now.hour >= 0 and (last_maintenance_day is None or last_maintenance_day != current_day):
-            logger.info("Midnight reached. Stopping task assignment for maintenance.")
-            run_maintenance("/app/config/YouTube.txt")
-            clear_assigned_tasks(db_pool)
-            last_maintenance_day = current_day
-            logger.info("Resuming task assignment post-maintenance.")
-            continue
+    asyncio.create_task(run_maintenance("/app/config/YouTube.txt"))
 
-        try:
-            client_socket, addr = server_socket.accept()
-            logger.info(f"Connected to {addr}")
-            client_socket.settimeout(60)
-            
-            # Wait for initial 'ready' packet
-            initial_data = client_socket.recv(1024).decode()
-            initial_packet = json.loads(initial_data)
-            if initial_packet.get('packet_type') != 'ready':
-                logger.warning(f"Unexpected initial packet from {addr}: {initial_packet}")
-                client_socket.close()
-                continue
-            
-            # Send pending task
-            task = get_pending_tasks(db_pool)
-            if task:
-                client_socket.send(json.dumps(task).encode())
-            else:
-                no_task_response = {
-                    'packet_type': 'no_tasks',
-                    'message': 'No pending tasks available at this time.'
-                }
-                client_socket.send(json.dumps(no_task_response).encode())
-                logger.info("No pending tasks available. Sent no_tasks response.")
-                client_socket.close()
-                continue
+    #asyncio.create_task()#TODO add code to refil tasks
 
-            # Wait for batch completion
-            response_data = client_socket.recv(4096).decode()  # Larger buffer for batch data
-            response = json.loads(response_data)
-            if response.get('packet_type') == 'batch_complete':
-                vid_id = response['vid_id']
-                results = response['results']
-                mark_tasks_complete(db_pool, vid_id, results)
-                logger.info(f"Batch completed for VID_ID: {vid_id} with {len(results)} models")
-            else:
-                logger.warning(f"Expected batch_complete, got: {response}")
-
-            client_socket.close()
-
-        except socket.timeout:
-            logger.info(f"Timeout waiting for client {addr}. Closing connection.")
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON from client {addr}: {e}, data: {response_data}")
-        except socket.error as e:
-            logger.error(f"Socket error with client {addr}: {e}")
-        except psycopg2.Error as e:
-            logger.error(f"Database error: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error with client {addr}: {e}")
-        finally:
-            try:
-                client_socket.close()
-            except:
-                pass
+    server = await asyncio.start_server(handle_client, '0.0.0.0', 5000)
+    logger.info("Server started, waiting for connections...")
+    
+    async with server:
+        await server.serve_forever()
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    finally:
+        db_pool.closeall()
+        logger.info("Database connection pool closed")
