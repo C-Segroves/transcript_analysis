@@ -10,16 +10,10 @@ from youtube_transcript_api import YouTubeTranscriptApi
 import os
 import logging
 
-# Logging is configured in server.py, so we'll rely on it being passed or set up there
-logger = logging.getLogger(__name__)
-
 # Load database configuration from file
 def load_db_config():
     with open('config/db_config.json', 'r') as f:
         return json.load(f)
-
-def load_db_params():
-    return load_db_config()
 
 # Load API key from file
 def get_api_key(api_key_path=None):
@@ -35,7 +29,7 @@ def execute_query(db_params, query, params=None):
             conn.commit()
             return cur
 
-def get_vid_json_list_from_channel(channel_id, after_date, api_key):
+def get_vid_json_list_from_channel(channel_id, after_date, api_key, logger:logging.Logger):
     if after_date is None:
         first_url = f'https://www.googleapis.com/youtube/v3/search?key={api_key}&channelId={channel_id}&part=snippet,id&order=date&maxResults=25'
     else:
@@ -71,7 +65,7 @@ def get_new_channels_to_pull_vid_data_for(db_params):
     with psycopg2.connect(**db_params) as conn:
         return pd.read_sql_query(sql_script, conn)
 
-def insert_vid_data_for_new_channels(db_params, api_key):
+def insert_vid_data_for_new_channels(db_params, api_key, logger:logging.Logger):
     channel_id_df = get_new_channels_to_pull_vid_data_for(db_params)
     
     insert_query_vid_table = sql.SQL("""
@@ -91,7 +85,7 @@ def insert_vid_data_for_new_channels(db_params, api_key):
             for channel_id in channel_id_df['channel_id']:
                 logger.info(f"Processing video data for new channel {channel_id}")
                 try:
-                    test_vid_list = get_vid_json_list_from_channel(channel_id, None, api_key)
+                    test_vid_list = get_vid_json_list_from_channel(channel_id, None, api_key,logger)
                     for page in test_vid_list:
                         for vid in page['items']:
                             if vid['id']['kind'] == 'youtube#video':
@@ -130,7 +124,7 @@ def get_date_of_last_vid_by_channel_df(db_params):
     with psycopg2.connect(**db_params) as conn:
         return pd.read_sql_query(sql_script, conn)
 
-def insert_new_vid_data_for_current_channels(db_params, api_key):
+def insert_new_vid_data_for_current_channels(db_params, api_key, logger:logging.Logger):
     vid_tab_df = get_date_of_last_vid_by_channel_df(db_params)
     
     insert_query_vid_table = sql.SQL("""
@@ -155,7 +149,7 @@ def insert_new_vid_data_for_current_channels(db_params, api_key):
                     if isinstance(latest_date, str):
                         latest_date = datetime.strptime(latest_date, "%Y-%m-%d %H:%M:%S")
                     latest_date_rfc3339 = latest_date.strftime("%Y-%m-%dT%H:%M:%SZ")
-                    test_vid_list = get_vid_json_list_from_channel(channel_id, latest_date_rfc3339, api_key)
+                    test_vid_list = get_vid_json_list_from_channel(channel_id, latest_date_rfc3339, api_key,logger)
                     for page in test_vid_list:
                         for vid in page['items']:
                             if vid['id']['kind'] == 'youtube#video':
@@ -186,7 +180,7 @@ def get_transcripts_to_be_pulled(db_params):
     with psycopg2.connect(**db_params) as conn:
         return pd.read_sql_query(sql_script, conn)
 
-def insert_new_transcripts(db_params):
+def insert_new_transcripts(db_params, logger:logging.Logger):
     needed_transcript_vid_id_df = get_transcripts_to_be_pulled(db_params)
     
     insert_query = sql.SQL("""
@@ -222,7 +216,7 @@ def insert_new_transcripts(db_params):
                         cur.execute(insert_query, (vid_id, "No transcript available", -1, 0, "", 0, 0, datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")))
                     conn.commit()
 
-def insert_initial_vid_model_states(db_params):
+def insert_initial_vid_model_states(db_params, logger:logging.Logger):
     logger.info("Getting new VID_IDs with transcripts that lack model states")
     sql_script = """
     SELECT DISTINCT v.VID_ID
@@ -259,13 +253,13 @@ def insert_initial_vid_model_states(db_params):
             cur.executemany(insert_query, assignments)
             conn.commit()
 
-def maintain_database(api_key_path):
-    db_params = load_db_params()
+def maintain_database(api_key_path, logger:logging.Logger):
+    db_params = load_db_config()
     api_key = get_api_key(api_key_path)
 
     # Add video data for new channels, quit on 403
     try:
-        insert_vid_data_for_new_channels(db_params, api_key)
+        insert_vid_data_for_new_channels(db_params, api_key,logger)
     except Exception as e:
         if "API quota likely exhausted" in str(e):
             logger.info("Quota exhausted. Skipping further API calls and moving to transcripts.")
@@ -274,7 +268,7 @@ def maintain_database(api_key_path):
 
     # Update video data for existing channels
     try:
-        insert_new_vid_data_for_current_channels(db_params, api_key)
+        insert_new_vid_data_for_current_channels(db_params, api_key,logger)
     except Exception as e:
         if "API quota likely exhausted" in str(e):
             logger.info("Quota exhausted. Skipping further API calls and moving to transcripts.")
@@ -282,10 +276,10 @@ def maintain_database(api_key_path):
             raise
 
     # Add transcripts
-    insert_new_transcripts(db_params)
+    insert_new_transcripts(db_params,logger)
 
     # Add initial states for new VID_IDs with transcripts
-    insert_initial_vid_model_states(db_params)
+    insert_initial_vid_model_states(db_params,logger)
 
     logger.info("Database maintenance completed.")
 

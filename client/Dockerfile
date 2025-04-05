@@ -1,15 +1,15 @@
-FROM python:3.9-slim
+FROM python:3.10-slim
 
 WORKDIR /app
 
 COPY client/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
 RUN python -m nltk.downloader punkt
 
 COPY client/client.py .
-RUN mkdir -p ./config
+COPY client/async_client.py .
+COPY client/async_processing_client.py .
+COPY packet_handler/ ./packet_handler/
 COPY config/db_config.json ./config/
-COPY config/models ./config/models/
 
-CMD ["python", "client.py"]
+CMD ["python", "async_processing_client.py"]
