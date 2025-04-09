@@ -67,9 +67,23 @@ def generate_client_acknowledgement_packet():
     init_packet={"packet_type":"client_acknowledgement","additional_data":{}}
     return init_packet
 
+def generate_client_play_packet():
+    init_packet={"packet_type":"play","additional_data":{}}
+    return init_packet
+
+def generate_client_pause_packet():
+    init_packet={"packet_type":"pause","additional_data":{}}
+    return init_packet
+
 def generate_received_process_task_packet():
     received_process_task_packet={'packet_type':'received_processed_task','additional_data':{}}
     return received_process_task_packet
+
+def generate_pause_packet():
+    pause_packet={'packet_type':'pause','additional_data':{}}
+
+def generate_resume_packet():
+    resume_packet={'packet_type':'resume','additional_data':{}}
 
 def mark_tasks_complete(db_pool, vid_id, results,logger):
     with db_pool.getconn() as conn:
@@ -110,25 +124,14 @@ class ProcessingServer(BaseServer):
         addr = writer.get_extra_info('peername')
         sock = writer.get_extra_info('socket')
         packet_type=packet['packet_type']
+        self.logger.info(f"Processing packet of type {packet_type} from {addr}")
 
         match packet_type:
             case    'init_packet':
                 self.logger.info(f"Received init packet from {addr}")
-                ack_packet=generate_client_acknowledgement_packet()
+                ack_packet=generate_client_play_packet()
+                logger.info(f"Sending play packet to {addr}")
                 await self.send_data(ack_packet, writer)
-            case    'task_request':
-                self.logger.info(f"Received task request from {addr}")
-                if len(self.task_que) == 0:
-                    logger.info(f'No tasks in queue. Attempting to reload task queue.{db_pool}')
-                    self.reload_task_queue(batch_size=66, n_gram_size=4, target_amount=20)
-                tasks=self.task_que.popleft()
-                await self.send_data(tasks, writer)
-            case    'results':
-                self.logger.info(f"Received results from {addr}")
-                #self.completed_task_que.appendleft(packet)
-                received_process_task_packet=generate_received_process_task_packet()
-                await asyncio.to_thread(mark_tasks_complete, db_pool, packet['vid_id'], packet['results'],logger)
-                await self.send_data(received_process_task_packet,writer)
             case    _:
                 self.logger.error(f'Server: Received {packet_type} packet')
                 pass

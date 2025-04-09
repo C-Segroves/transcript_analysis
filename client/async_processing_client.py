@@ -17,7 +17,7 @@ from nltk.tokenize import word_tokenize
 from async_client import BaseClient
 
 model_dict = {}
-
+current_task = None
 
 
 def load_config():
@@ -69,6 +69,56 @@ def generate_task_request_packet():
     request_packet={'packet_type':'task_request','additional_data':{}}
     return request_packet
 
+def get_pending_tasks(logger,batch_size=100, n_gram_size=4,conn=None):
+    try:
+        logger.info('Attempting to get pending tasks from database.')
+        cursor = conn.cursor()
+        get_vid_id_query = "SELECT VID_ID FROM VID_MODEL_STATE WHERE STATE IS NULL LIMIT 1"
+        cursor.execute(get_vid_id_query)
+        vid_ids = [row[0] for row in cursor.fetchall()]
+        if not vid_ids:
+            #self.db_pool.putconn(conn)
+            logger.info('No pending tasks found in database.')
+            return None
+        vid_id = vid_ids[0]
+
+        logger.info(f'VID_ID {vid_id} has been selected for processing.')
+        
+        get_model_keys_query = "SELECT MODEL_KEY FROM VID_MODEL_STATE WHERE VID_ID = %s AND STATE IS NULL LIMIT %s"
+        cursor.execute(get_model_keys_query, (vid_id, batch_size))
+        model_keys = [row[0] for row in cursor.fetchall()]
+        num_model_keys = len(model_keys)
+        model_keys = model_keys[0:min(batch_size, num_model_keys)]
+        assignments = [(vid_id, model_key) for model_key in model_keys]
+
+        logger.info(f'VID_ID {vid_id} has been assigned the following model keys: {model_keys}')
+        
+        assigned_task_query = "UPDATE VID_MODEL_STATE SET STATE = 'pending' WHERE VID_ID=%s AND MODEL_KEY=%s"
+        cursor.executemany(assigned_task_query, assignments)
+        conn.commit()
+        #self.db_pool.putconn(conn)
+
+        pending_task = {
+            'packet_type': 'task_packet',
+            'additional_data': {
+                'vid_id': vid_id,
+                'model_keys': model_keys,
+                'n_gram_size': n_gram_size
+            }
+        }
+        logger.info(f'Pending task created: {pending_task}')
+        return pending_task
+    except psycopg2.Error as e:
+        logger.error(f"Database error fetching transcript for VID_ID {vid_id}: {e}")
+        if "current transaction is aborted" in str(e).lower():
+            logger.critical("Transaction aborted detected. Aborting client.")
+            conn.rollback()
+            sys.exit(1)
+        conn.rollback()
+        return []
+    finally:
+        cursor.close()
+
 def get_transcript(vid_id, n_gram_size,conn=None):
     try:
         cursor = conn.cursor()
@@ -106,12 +156,15 @@ def handle_task_packet(db_pool,packet,logger):
 
     results = []
 
+    # Manually acquire connection
+    conn = db_pool.getconn()
+
+    if packet==None:
+        packet=get_pending_tasks(logger, n_gram_size=4,conn=conn,batch_size=100)
+    
     vid_id=packet.get('additional_data').get('vid_id')
     model_keys=packet.get('additional_data').get('model_keys')
     n_gram_size=packet.get('additional_data').get('n_gram_size')
-
-    # Manually acquire connection
-    conn = db_pool.getconn()
     logger.debug(f"Acquired connection for VID_ID {vid_id}: {id(conn)}")
 
     try:
@@ -291,11 +344,14 @@ def log_pool_stats(db_pool, logger):
     logger.info(f"Connection pool stats - min: {db_pool.minconn}, max: {db_pool.maxconn}, "
                 f"open: {len(db_pool._used)}, free: {len(db_pool._pool)}")
 
+
+
 class ProcessingClient(BaseClient):
     def __init__(self,host,port,logger,config):
         super().__init__(host, port,logger,config)
         #self.db_path=config['path_to_server']
         self.db_pool=db_pool
+        self.client_state= 'pause'
     
     async def handle_error(self):
         self.logger.info('Attempting to reconnect...')
@@ -306,20 +362,14 @@ class ProcessingClient(BaseClient):
         logger.info(f'Processing packet of type: {packet_type}')
         try:
             match packet_type:
-                case    'task_packet':
-                    logger.info(f'Received task packet.')
-                    results_packet=handle_task_packet(self.db_pool,packet,logger)
+                case    'play':
+                    self.logger.info('Received play packet. Resuming client.')
+                    self.client_state='play'
+                    await self.process_tasks()
 
-                    await self.send_data(results_packet)
-                    num_models=len(results_packet['results'])
-                    logger.info(f'Processing complete. Sending task results packet with {num_models} results.')
-                case    'client_acknowledgement':
-                    task_request_packet=generate_task_request_packet()
-                    await self.send_data(task_request_packet)
-                    pass
-                case    'received_processed_task':
-                    task_request_packet=generate_task_request_packet()
-                    await self.send_data(task_request_packet)
+                case    'pause':
+                    self.logger.info('Received pause packet. Pausing client.')
+                    self.client_state='pause'
                 case 'shutdown_request':
                     await self.graceful_shutdown()
                 case    _:
@@ -334,8 +384,23 @@ class ProcessingClient(BaseClient):
         self.machine_name=socket.gethostname()
         self.task_time_tracker_last_time=time.time()
 
+       
         init_packet=generate_client_init_packet()
+        self.logger.info(f'Initializing client with machine name: {self.machine_name} : {init_packet}')
         await self.send_data(init_packet)
+    
+    async def process_tasks(self):
+        while True:
+            if self.client_state=='play':
+                results_packet=handle_task_packet(self.db_pool,current_task,logger)
+                logger.info(f'Processing complete. Got results packet with {len(results_packet["results"])} results.')
+            
+            elif self.client_state=='pause':
+                self.logger.info('Client is paused. Waiting for resume signal.')
+                await asyncio.sleep(1)
+            else:
+                self.logger.error(f'Unknown client state. Exiting. {self.client_state}')
+                break
 
     async def reconnect(self):
         max_retries = 5
