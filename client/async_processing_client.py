@@ -206,6 +206,22 @@ def handle_task_packet(db_pool,packet,logger):
 
     return results_packet
 
+def mark_tasks_complete(vid_id, results, logger,conn=None):
+    with db_pool.getconn() as conn:
+        cursor = conn.cursor()
+        update_query = """
+            UPDATE VID_MODEL_STATE 
+            SET STATE = 'complete'
+            WHERE VID_ID = %s AND MODEL_KEY = %s
+        """
+        for result in results:
+            model_key = result['model_key']
+            cursor.execute(update_query, (vid_id, model_key))
+        conn.commit()
+        num_models = len(results)
+        db_pool.putconn(conn)
+        logger.info(f"Task completed for VID_ID: {vid_id} for {num_models} models.")
+
 def generate_results_packet(vid_id,results):
     batch_complete_packet = {
                     'packet_type': 'results',
