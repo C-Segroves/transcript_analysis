@@ -111,10 +111,11 @@ class ProcessingServer(BaseServer):
         self.logger.info(f"Client disconnected. Active clients: {len(self.writers)}")
 
     async def maintenance_task(self):
+        """Runs at 22:56 local time: pauses clients, runs maintenance, resumes clients"""
         while True:
             now = datetime.now()
             self.logger.debug(f"Current time: {now.hour}:{now.minute}")
-            if now.hour == 3 and now.minute == 12:
+            if now.hour == 4 and now.minute == 0:
                 self.logger.info(f"Maintenance triggered at {now}")
                 self.server_state = 'maintenance'
 
@@ -123,6 +124,7 @@ class ProcessingServer(BaseServer):
                 pause_packet = generate_client_pause_packet()
                 for writer in self.writers.copy():
                     try:
+                        logger.info(f"Sending {pause_packet} packet to {writer.get_extra_info('peername')}")
                         await self.send_data(pause_packet, writer)
                     except Exception as e:
                         self.logger.error(f"Failed to send pause to client: {e}")
