@@ -469,7 +469,7 @@ if __name__ == "__main__":
 
     db_pool = pool.ThreadedConnectionPool(1, 20, **DB_CONFIG)
     server_host = os.environ.get('SERVER_HOST', 'localhost')
-    machine_name = os.environ.get('hostname', 'localhost')
+    machine_name = os.environ.get('machine_name', 'localhost')
     logger.info(f"Server host: {server_host}")
 
     client = ProcessingClient(server_host, machine_name, 5000, logger, config)
