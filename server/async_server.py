@@ -22,24 +22,23 @@ class BaseServer:
 
     async def handle_client(self, reader, writer):
         addr = writer.get_extra_info('peername')
-        print(f"New connection from {addr}")
         self.logger.info(f"New connection from {addr}")
-        self.clients.add(writer)
-        
         try:
             while True:
-                data = await self.receive_data(reader)
-                if not data:
-                    break
-                await self.process_data(data, writer)
-        except asyncio.CancelledError:
-            pass
+                length_bytes = await reader.readexactly(4)
+                length = int.from_bytes(length_bytes, 'big')
+                data = await reader.readexactly(length)
+                self.logger.debug(f"Raw data received from {addr}: {data}")
+                packet = json.loads(data.decode())
+                self.logger.debug(f"Decoded packet from {addr}: {packet}")
+                await self.process_data(packet, writer)
+        except asyncio.IncompleteReadError:
+            self.logger.info(f"Client {addr} disconnected.")
+        except Exception as e:
+            self.logger.error(f"Error handling client {addr}: {e}")
         finally:
-            writer.close()
-            await writer.wait_closed()
-            self.clients.remove(writer)
-            print(f"Connection closed for {addr}")
-            self.logger.info(f"Connection closed for {addr}")
+            self.writers.discard(writer)
+            self.logger.info(f"Client {addr} disconnected. Active clients: {len(self.writers)}")
 
     async def receive_data(self, reader):
         # Read the length of the message

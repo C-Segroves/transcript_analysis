@@ -32,14 +32,19 @@ class BaseClient:
 
     async def send_data(self, data):
         # Serialize the dictionary to JSON
-        json_data = json.dumps(data).encode()
+        try:
+            json_data = json.dumps(data).encode()
+            
+            # Send the length of the message
+            self.writer.write(len(json_data).to_bytes(4, 'big'))
+            
+            # Send the JSON data
+            self.writer.write(json_data)
+            await self.writer.drain()
+            self.logger.debug(f"Sent {data} to server")
+        except Exception as e:
+            self.logger.error(f"Error sending data: {e}")
         
-        # Send the length of the message
-        self.writer.write(len(json_data).to_bytes(4, 'big'))
-        
-        # Send the JSON data
-        self.writer.write(json_data)
-        await self.writer.drain()
 
     async def process_received_data(self, data):
         # This method should be overridden by subclasses
