@@ -74,6 +74,7 @@ class ProcessingServer(BaseServer):
         self.task_que = deque()
         self.completed_task_que = deque()
         self.writers = set()  # Track connected clients
+        self.clients ={}
         self.server_state = 'running'
 
     async def send_data(self, data, writer):
@@ -93,7 +94,9 @@ class ProcessingServer(BaseServer):
         self.logger.info(f"Processing packet of type {packet_type} from {addr} (state: {self.server_state})")
         match packet_type:
             case 'init_packet':
-                self.logger.info(f"Received init packet from {addr}")
+                #{"packet_type": "init_packet", "additional_data": {"machine_name": machine_name}}
+                writer_name = packet['additional_data'].get('machine_name', 'Unknown')
+                self.logger.info(f"Received init packet from {addr}, machine name: {writer_name}")
                 self.writers.add(writer)  # Add client to tracked writers
                 self.logger.info(f"Active clients: {len(self.writers)}")
                 if self.server_state == 'running':
@@ -102,6 +105,8 @@ class ProcessingServer(BaseServer):
                     ack_packet = generate_client_pause_packet()
                 logger.info(f"Sending {ack_packet} packet to {addr}")
                 await self.send_data(ack_packet, writer)
+            case 'health_packet':
+                self.logger.info(f"Received health packet from {addr} , packet: {packet}")
             case _:
                 self.logger.error(f'Server: Received {packet_type} packet')
 
@@ -114,7 +119,7 @@ class ProcessingServer(BaseServer):
         """Runs at 22:56 local time: pauses clients, runs maintenance, resumes clients"""
         while True:
             now = datetime.now()
-            self.logger.debug(f"Current time: {now.hour}:{now.minute}")
+            #self.logger.debug(f"Current time: {now.hour}:{now.minute}")
             if now.hour == 4 and now.minute == 0:
                 self.logger.info(f"Maintenance triggered at {now}")
                 self.server_state = 'maintenance'
@@ -151,6 +156,24 @@ class ProcessingServer(BaseServer):
             # Sleep to prevent tight loop
             await asyncio.sleep(30)  # Check every 30 seconds
 
+    async def health_check_task(self):
+        """Runs every hour to send health_check packets to all clients."""
+        while True:
+            self.logger.info("Starting hourly health check for all clients.")
+            health_check_packet = {"packet_type": "health_check", "additional_data": {}}
+
+            for writer in self.writers.copy():
+                addr = writer.get_extra_info('peername')
+                try:
+                    self.logger.info(f"Sending health_check packet to {addr}")
+                    await self.send_data(health_check_packet, writer)
+                except Exception as e:
+                    self.logger.error(f"Error sending health_check to client {addr}: {e}")
+                    self.writers.discard(writer)  # Remove client on error
+
+            self.logger.info("Hourly health check completed.")
+            await asyncio.sleep(3600)  # Wait for 1 hour before the next health check #3600
+
     async def start(self):
         server = await asyncio.start_server(
             self.handle_client, self.host, self.port)
@@ -160,6 +183,7 @@ class ProcessingServer(BaseServer):
 
         # Create tasks
         maintenance_task = asyncio.create_task(self.maintenance_task())
+        health_check_task = asyncio.create_task(self.health_check_task())
         server_task = asyncio.create_task(server.serve_forever())
 
         try:
@@ -170,6 +194,7 @@ class ProcessingServer(BaseServer):
             self.logger.error(f"An error occurred: {e}")
         finally:
             maintenance_task.cancel()
+            health_check_task.cancel()
             server_task.cancel()
             self.logger.info("Server shut down complete.")
 

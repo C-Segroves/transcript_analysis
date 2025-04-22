@@ -10,6 +10,22 @@ import multiprocessing as mp
 from psycopg2 import pool
 import psycopg2
 import sys
+import signal
+
+import platform
+
+if platform.system() == "Windows":
+    try:
+        import wmi
+        print("WMI library loaded successfully.")
+    except ImportError as e:
+        print(f"Failed to import WMI: {e}")
+else:
+    print("WMI is not required on non-Windows platforms.")
+
+
+import psutil
+
 from nltk.util import ngrams, pad_sequence, everygrams
 from nltk.tokenize import word_tokenize
 
@@ -41,8 +57,42 @@ def setup_logger(log_file_path):
     logger.addHandler(ch)
     return logger
 
-def generate_client_init_packet():
-    return {"packet_type": "init_packet", "additional_data": {}}
+def get_cpu_temp_linux():
+    try:
+        # psutil.sensors_temperatures() returns a dictionary of temperature sensors
+        temps = psutil.sensors_temperatures()
+        if "coretemp" in temps:  # 'coretemp' is common for CPU temperature
+            for entry in temps["coretemp"]:
+                if entry.label == "Package id 0":  # CPU package temperature
+                    return entry.current
+        elif "cpu-thermal" in temps:  # Some systems use 'cpu-thermal'
+            return temps["cpu-thermal"][0].current
+        else:
+            return "CPU temperature sensor not found."
+    except Exception as e:
+        return f"Error reading CPU temperature: {e}"
+
+def get_cpu_temp_windows_wmi():
+    try:
+        w = wmi.WMI(namespace="root\OpenHardwareMonitor")
+        temperature_info = w.Sensor()
+        for sensor in temperature_info:
+            if sensor.SensorType == "Temperature":
+                return sensor.Value  # Return the first temperature value
+    except Exception as e:
+        return f"Error reading CPU temperature: {e}"
+
+def get_cpu_temp():
+    system = platform.system()
+    if system == "Linux":
+        return get_cpu_temp_linux()
+    elif system == "Windows":
+        return get_cpu_temp_windows_wmi()
+    else:
+        return "Unsupported OS"
+
+def generate_client_init_packet(machine_name):
+    return {"packet_type": "init_packet", "additional_data": {"machine_name": machine_name}}
 
 def generate_task_request_packet():
     return {'packet_type': 'task_request', 'additional_data': {}}
@@ -125,7 +175,7 @@ def prep_transcript(transcript, n_gram_size):
         logger.error(f"Error preparing transcript: {e}")
         return []
 
-def handle_task_packet(db_pool, packet, logger):
+def handle_task_packet(db_pool, packet, logger): 
     log_pool_stats(db_pool, logger)
     results = []
     conn = db_pool.getconn()
@@ -305,12 +355,18 @@ def log_pool_stats(db_pool, logger):
     logger.info(f"Connection pool stats - min: {db_pool.minconn}, max: {db_pool.maxconn}, "
                 f"open: {len(db_pool._used)}, free: {len(db_pool._pool)}")
 
+def generate_health_packet(machine_name):
+    cpu_temp=get_cpu_temp()
+    return {'packet_type': 'health_packet', 'additional_data': {'machine_name': machine_name,'cpu_temp': cpu_temp}}
+
 class ProcessingClient(BaseClient):
-    def __init__(self, host, port, logger, config):
+    def __init__(self, host,machine_name, port, logger, config):
         super().__init__(host, port, logger, config)
         self.db_pool = db_pool
         self.client_state = 'pause'
         self.task_task = None  # Track the task processing coroutine
+        self.machine_name = machine_name
+        logger.info(f"Client initialized with machine name: {self.machine_name}")
 
     async def handle_error(self):
         self.logger.info('Attempting to reconnect...')
@@ -335,6 +391,9 @@ class ProcessingClient(BaseClient):
                             await self.task_task
                         except asyncio.CancelledError:
                             self.logger.info("Task processing cancelled due to pause")
+                case 'health_check':
+                    health_packet=generate_health_packet(self.machine_name)
+                    await self.send_data(health_packet)
                 case 'shutdown_request':
                     await self.graceful_shutdown()
                 case _:
@@ -345,10 +404,10 @@ class ProcessingClient(BaseClient):
 
     async def initialize_client(self):
         self.config = load_config()
-        self.machine_name = socket.gethostname()
+        #self.machine_name = socket.gethostname()
         self.task_time_tracker_last_time = time.time()
         
-        init_packet = generate_client_init_packet()
+        init_packet = generate_client_init_packet(self.machine_name)
         self.logger.info(f'Initializing client with machine name: {self.machine_name} : {init_packet}')
         await self.send_data(init_packet)
 
@@ -406,12 +465,26 @@ class ProcessingClient(BaseClient):
 
 if __name__ == "__main__":
     config = load_config()
-    print(config)
     logger = setup_logger('')
 
     db_pool = pool.ThreadedConnectionPool(1, 20, **DB_CONFIG)
     server_host = os.environ.get('SERVER_HOST', 'localhost')
+    machine_name = os.environ.get('hostname', 'localhost')
     logger.info(f"Server host: {server_host}")
-    
-    client = ProcessingClient(server_host, 5000, logger, config)
-    asyncio.run(client.run())
+
+    client = ProcessingClient(server_host, machine_name, 5000, logger, config)
+
+    # Signal handling for graceful shutdown
+    def handle_signal(signal_number, frame):
+        logger.warning(f"Received signal {signal_number}. Initiating shutdown.")
+        asyncio.run(client.graceful_shutdown())
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    try:
+        asyncio.run(client.run())
+    except Exception as e:
+        logger.critical(f"Unhandled exception in main: {e}", exc_info=True)
+    finally:
+        logger.info("Client has exited.")
