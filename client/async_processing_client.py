@@ -357,7 +357,15 @@ def log_pool_stats(db_pool, logger):
 
 def generate_health_packet(machine_name):
     cpu_temp=get_cpu_temp()
-    return {'packet_type': 'health_packet', 'additional_data': {'machine_name': machine_name,'cpu_temp': cpu_temp}}
+    cpu_usage = psutil.cpu_percent(interval=1)
+    memory_info = psutil.virtual_memory()
+    memory_usage = memory_info.percent
+    #todo if memory is above 50% dump some models
+    if memory_usage > 50:
+        logger.warning(f"Memory usage is high: {memory_usage}%")
+        model_dict.clear()  # Clear the model cache if memory usage is high
+
+    return {'packet_type': 'health_packet', 'additional_data': {'machine_name': machine_name,'cpu_temp': cpu_temp, 'cpu_usage': cpu_usage, 'memory_usage': memory_usage}}
 
 class ProcessingClient(BaseClient):
     def __init__(self, host,machine_name, port, logger, config):
