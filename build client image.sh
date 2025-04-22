@@ -13,7 +13,7 @@ docker build -t my-client-image -f client/Dockerfile .
 if [ $? -eq 0 ]; then
     echo "Client image built successfully!"
     echo "Running Client Image..."
-    docker run -it --name client-container -e SERVER_HOST=$SERVER_HOST -e MACHINE_NAME=$MACHINE_NAME my-client-image
+    docker run -it --name client-container -e SERVER_HOST=$SERVER_HOST -e machine_name=$MACHINE_NAME my-client-image
 else
     echo "Failed to build client image. Check the output for errors."
     exit 1
