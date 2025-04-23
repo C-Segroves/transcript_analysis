@@ -194,7 +194,7 @@ def handle_task_packet(db_pool, packet, logger,times):
 
     try:
         get_transcript_start = time.time()
-        transcript,times = get_transcript(vid_id, n_gram_size, conn)
+        transcript = get_transcript(vid_id, n_gram_size, conn)
         get_transcript_time = get_transcript_start - time.time()
         times['get_transcript_time'] = get_transcript_time
 
