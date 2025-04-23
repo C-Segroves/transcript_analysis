@@ -194,7 +194,7 @@ def handle_task_packet(db_pool, packet, logger,times):
 
     try:
         get_transcript_start = time.time()
-        transcript = get_transcript(vid_id, n_gram_size, conn)
+        transcript,times = get_transcript(vid_id, n_gram_size, conn)
         get_transcript_time = get_transcript_start - time.time()
         times['get_transcript_time'] = get_transcript_time
 
@@ -212,7 +212,8 @@ def handle_task_packet(db_pool, packet, logger,times):
                     'time_taken': 0
                 })
         else:
-            get_score_start = time.time()
+            score_times={}
+            get_total_score_start = time.time()
             for model_key in model_keys:
                 score, time_taken = process_task(transcript_items, model_key, vid_id, n_gram_size, logger, conn)
                 results.append({
@@ -220,8 +221,10 @@ def handle_task_packet(db_pool, packet, logger,times):
                     'score': score,
                     'time_taken': time_taken
                 })
-            get_score_time = get_score_start - time.time()
-            times['get_score_time'] = get_score_time
+                score_times[model_key] = time_taken
+            get_total_score_time = get_total_score_start - time.time()
+            times['get_total_score_time'] = get_total_score_time
+            times['individual_model_score_times'] = score_times
         
         get_save_results_start = time.time()
         save_results(vid_id, results, conn)
