@@ -49,7 +49,7 @@ DB_CONFIG = load_config()
 
 def setup_logger(log_file_path):
     logger = logging.getLogger('ProcessingClient')
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)#logging.DEBUG
     ch = logging.StreamHandler()
     ch.setLevel(logging.DEBUG)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -175,13 +175,17 @@ def prep_transcript(transcript, n_gram_size):
         logger.error(f"Error preparing transcript: {e}")
         return []
 
-def handle_task_packet(db_pool, packet, logger): 
+def handle_task_packet(db_pool, packet, logger,times): 
     log_pool_stats(db_pool, logger)
     results = []
     conn = db_pool.getconn()
 
+    get_packet_start=time.time()
     if packet is None:
         packet = get_pending_tasks(logger, n_gram_size=4, conn=conn, batch_size=100)
+    get_packet_time=get_packet_start-time.time()
+
+    times['get_packet_time'] = get_packet_time
     
     vid_id = packet.get('additional_data').get('vid_id')
     model_keys = packet.get('additional_data').get('model_keys')
@@ -189,8 +193,15 @@ def handle_task_packet(db_pool, packet, logger):
     logger.debug(f"Acquired connection for VID_ID {vid_id}: {id(conn)}")
 
     try:
-        transcript = get_transcript(vid_id, n_gram_size, conn)
+        get_transcript_start = time.time()
+        transcript,times = get_transcript(vid_id, n_gram_size, conn)
+        get_transcript_time = get_transcript_start - time.time()
+        times['get_transcript_time'] = get_transcript_time
+
+        get_transcript_items_start=time.time()
         transcript_items = [(item, transcript[j:j+n_gram_size-1]) for j, item in enumerate(transcript[n_gram_size-1:]) if j + n_gram_size - 1 < len(transcript)]
+        get_transcript_items_time = get_transcript_items_start - time.time()
+        times['get_transcript_items_time']=get_transcript_items_time
 
         if not transcript_items:
             logger.info(f"No transcript found for VID_ID {vid_id}. Assigning empty scores.")
@@ -201,6 +212,8 @@ def handle_task_packet(db_pool, packet, logger):
                     'time_taken': 0
                 })
         else:
+            score_times={}
+            get_total_score_start = time.time()
             for model_key in model_keys:
                 score, time_taken = process_task(transcript_items, model_key, vid_id, n_gram_size, logger, conn)
                 results.append({
@@ -208,8 +221,15 @@ def handle_task_packet(db_pool, packet, logger):
                     'score': score,
                     'time_taken': time_taken
                 })
+                score_times[model_key] = time_taken
+            get_total_score_time = get_total_score_start - time.time()
+            times['get_total_score_time'] = get_total_score_time
+            times['individual_model_score_times'] = score_times
         
+        get_save_results_start = time.time()
         save_results(vid_id, results, conn)
+        get_save_results_time = get_save_results_start - time.time()
+        times['save_results_time'] = get_save_results_time
     
     except Exception as e:
         logger.error(f"Error processing task for VID_ID {vid_id}: {e}")
@@ -220,6 +240,11 @@ def handle_task_packet(db_pool, packet, logger):
         db_pool.putconn(conn)
 
     results_packet = generate_results_packet(vid_id, results)
+
+    total_task_time=times['start']-time.time()
+    times['total_task_time'] = total_task_time
+    logger.info(f"Task processing times: {times}")
+
     return results_packet
 
 def mark_tasks_complete(vid_id, results, logger, conn=None):
@@ -421,7 +446,9 @@ class ProcessingClient(BaseClient):
 
     async def process_tasks(self):
         while self.client_state == 'play':
-            results_packet = handle_task_packet(self.db_pool, current_task, self.logger)
+            times={}
+            times['start'] = time.time()
+            results_packet = handle_task_packet(self.db_pool, current_task, self.logger,times)
             self.logger.info(f'Processing complete. Got results packet with {len(results_packet["results"])} results.')
             await asyncio.sleep(0.1)  # Yield to allow packet processing
         

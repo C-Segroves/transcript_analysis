@@ -51,22 +51,6 @@ def generate_client_play_packet():
 def generate_client_pause_packet():
     return {"packet_type": "pause", "additional_data": {}}
 
-def mark_tasks_complete(db_pool, vid_id, results, logger):
-    with db_pool.getconn() as conn:
-        cursor = conn.cursor()
-        update_query = """
-            UPDATE VID_MODEL_STATE 
-            SET STATE = 'complete'
-            WHERE VID_ID = %s AND MODEL_KEY = %s
-        """
-        for result in results:
-            model_key = result['model_key']
-            cursor.execute(update_query, (vid_id, model_key))
-        conn.commit()
-        num_models = len(results)
-        db_pool.putconn(conn)
-        logger.info(f"Task completed for VID_ID: {vid_id} for {num_models} models.")
-
 class ProcessingServer(BaseServer):
     def __init__(self, host, port, logger, config):
         super().__init__(host, port, logger)
@@ -91,7 +75,7 @@ class ProcessingServer(BaseServer):
     async def process_data(self, packet, writer):
         addr = writer.get_extra_info('peername')
         packet_type = packet['packet_type']
-        self.logger.info(f"Processing packet of type {packet_type} from {addr} (state: {self.server_state})")
+        self.logger.debug(f"Processing packet of type {packet_type} from {addr} (state: {self.server_state})")
         match packet_type:
             case 'init_packet':
                 #{"packet_type": "init_packet", "additional_data": {"machine_name": machine_name}}
@@ -108,7 +92,7 @@ class ProcessingServer(BaseServer):
             case 'health_packet':
                 self.logger.info(f"Received health packet from {addr} , packet: {packet}")
             case _:
-                self.logger.error(f'Server: Received {packet_type} packet')
+                self.logger.error(f'Server: Received unknown packet type: {packet_type} packet')
 
     async def handle_client(self, reader, writer):
         await super().handle_client(reader, writer)
@@ -119,7 +103,6 @@ class ProcessingServer(BaseServer):
         """Runs at 22:56 local time: pauses clients, runs maintenance, resumes clients"""
         while True:
             now = datetime.now()
-            #self.logger.debug(f"Current time: {now.hour}:{now.minute}")
             if now.hour == 4 and now.minute == 0:
                 self.logger.info(f"Maintenance triggered at {now}")
                 self.server_state = 'maintenance'
@@ -157,9 +140,9 @@ class ProcessingServer(BaseServer):
             await asyncio.sleep(30)  # Check every 30 seconds
 
     async def health_check_task(self):
-        """Runs every hour to send health_check packets to all clients."""
+        """Runs every {some period} to send health_check packets to all clients."""
         while True:
-            self.logger.info("Starting hourly health check for all clients.")
+            self.logger.info("Starting health check for all clients.")
             health_check_packet = {"packet_type": "health_check", "additional_data": {}}
 
             for writer in self.writers.copy():
@@ -172,7 +155,7 @@ class ProcessingServer(BaseServer):
                     self.writers.discard(writer)  # Remove client on error
 
             self.logger.info("Hourly health check completed.")
-            await asyncio.sleep(600)  # Wait for 1 hour before the next health check #3600
+            await asyncio.sleep(600)  # Wait for <- that amount over there before the next health check #3600
 
     async def start(self):
         server = await asyncio.start_server(
@@ -205,10 +188,8 @@ if __name__ == "__main__":
     db_pool = pool.ThreadedConnectionPool(1, 20, **DB_CONFIG)
     config = load_config()
     logger = setup_logger('')
-    print(logger)
 
     server = ProcessingServer(host, port, logger, config)
-    print(server)
 
     clear_assigned_tasks(db_pool)
     
