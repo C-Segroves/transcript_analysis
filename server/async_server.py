@@ -14,7 +14,6 @@ class BaseServer:
             self.handle_client, self.host, self.port)
         
         addr = server.sockets[0].getsockname()
-        print(f'Serving on {addr}')
         self.logger.info(f'Serving on {addr}')
 
         async with server:
@@ -28,9 +27,7 @@ class BaseServer:
                 length_bytes = await reader.readexactly(4)
                 length = int.from_bytes(length_bytes, 'big')
                 data = await reader.readexactly(length)
-                self.logger.debug(f"Raw data received from {addr}: {data}")
                 packet = json.loads(data.decode())
-                self.logger.debug(f"Decoded packet from {addr}: {packet}")
                 await self.process_data(packet, writer)
         except asyncio.IncompleteReadError:
             self.logger.info(f"Client {addr} disconnected.")
@@ -64,7 +61,7 @@ class BaseServer:
         # This method should be overridden by subclasses
         pass
 
-    async def run(self):
+        """    async def run(self):
         server = await asyncio.start_server(
             self.handle_client, self.host, self.port)
         
@@ -72,8 +69,8 @@ class BaseServer:
         self.logger.info(f'Serving on {addr}')
 
         async with server:
-            await self.server_main_loop()
+            await self.server_main_loop()"""
 
-    async def server_main_loop(self):
+        """    async def server_main_loop(self):
         # This method can be overridden by subclasses to add additional tasks
-        await asyncio.Future()  # Run forever
+        await asyncio.Future()  # Run forever"""
