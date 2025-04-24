@@ -9,6 +9,7 @@ RUN python -m nltk.downloader punkt
 COPY client/client.py .
 COPY client/async_client.py .
 COPY client/async_processing_client.py .
+COPY client/task_processor.py .
 COPY packet_handler/ ./packet_handler/
 COPY config/db_config.json ./config/
 

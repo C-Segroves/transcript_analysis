@@ -14,6 +14,11 @@ import signal
 
 import platform
 
+import task_processor as tp
+
+from aiomultiprocess import Pool
+
+
 if platform.system() == "Windows":
     try:
         import wmi
@@ -175,73 +180,76 @@ def prep_transcript(transcript, n_gram_size):
         logger.error(f"Error preparing transcript: {e}")
         return []
 
-def handle_task_packet(db_pool, packet, logger,times): 
+
+from aiomultiprocess import Pool
+
+async def handle_task_packet(db_pool, packet, logger, times):
     log_pool_stats(db_pool, logger)
     results = []
     conn = db_pool.getconn()
 
-    get_packet_start=time.time()
-    if packet is None:
-        packet = get_pending_tasks(logger, n_gram_size=4, conn=conn, batch_size=100)
-    get_packet_time=get_packet_start-time.time()
-
-    times['get_packet_time'] = get_packet_time
-    
-    vid_id = packet.get('additional_data').get('vid_id')
-    model_keys = packet.get('additional_data').get('model_keys')
-    n_gram_size = packet.get('additional_data').get('n_gram_size')
-    logger.debug(f"Acquired connection for VID_ID {vid_id}: {id(conn)}")
-
     try:
+        # Fetch pending tasks if no packet is provided
+        get_packet_start = time.time()
+        if packet is None:
+            packet = get_pending_tasks(logger, n_gram_size=4, conn=conn, batch_size=100)
+        get_packet_time = time.time() - get_packet_start
+        times['get_packet_time'] = get_packet_time
+
+        vid_id = packet.get('additional_data').get('vid_id')
+        model_keys = packet.get('additional_data').get('model_keys')
+        n_gram_size = packet.get('additional_data').get('n_gram_size')
+        logger.debug(f"Acquired connection for VID_ID {vid_id}: {id(conn)}")
+
+        # Get transcript and prepare transcript items
         get_transcript_start = time.time()
         transcript = get_transcript(vid_id, n_gram_size, conn)
-        get_transcript_time = get_transcript_start - time.time()
+        get_transcript_time = time.time() - get_transcript_start
         times['get_transcript_time'] = get_transcript_time
 
-        get_transcript_items_start=time.time()
-        transcript_items = [(item, transcript[j:j+n_gram_size-1]) for j, item in enumerate(transcript[n_gram_size-1:]) if j + n_gram_size - 1 < len(transcript)]
-        get_transcript_items_time = get_transcript_items_start - time.time()
-        times['get_transcript_items_time']=get_transcript_items_time
+        transcript_items = [
+            (item, transcript[j:j + n_gram_size - 1])
+            for j, item in enumerate(transcript[n_gram_size - 1:])
+            if j + n_gram_size - 1 < len(transcript)
+        ]
 
         if not transcript_items:
             logger.info(f"No transcript found for VID_ID {vid_id}. Assigning empty scores.")
-            for model_key in model_keys:
-                results.append({
-                    'model_key': model_key,
-                    'score': [],
-                    'time_taken': 0
-                })
+            results = [{'model_key': model_key, 'score': [], 'time_taken': 0} for model_key in model_keys]
         else:
-            score_times={}
-            get_total_score_start = time.time()
-            for model_key in model_keys:
-                score, time_taken = process_task(transcript_items, model_key, vid_id, n_gram_size, logger, conn)
-                results.append({
-                    'model_key': model_key,
-                    'score': score,
-                    'time_taken': time_taken
-                })
-                score_times[model_key] = time_taken
-            get_total_score_time = get_total_score_start - time.time()
-            times['get_total_score_time'] = get_total_score_time
-            times['individual_model_score_times'] = score_times
-        
+            # Load missing models outside of process_task
+            missing_models = [key for key in model_keys if key not in model_dict]
+            if missing_models:
+                loaded_models = load_model_from_db(conn, missing_models, logger)
+                model_dict.update(loaded_models)
+
+            # Use aiomultiprocess to process tasks in parallel
+            async with Pool() as pool:
+                tasks = [
+                    #process_task(transcript_items, model_key,model, vid_id, n_gram_size, logger)
+                    pool.apply(
+                        tp.process_task,
+                        args=(transcript_items, model_key, model_dict[model_key], vid_id, n_gram_size, logger)
+                    )
+                    for model_key in model_keys
+                ]
+                results = await asyncio.gather(*tasks)
+
+        # Save results to the database
         get_save_results_start = time.time()
         save_results(vid_id, results, conn)
-        get_save_results_time = get_save_results_start - time.time()
+        get_save_results_time = time.time() - get_save_results_start
         times['save_results_time'] = get_save_results_time
-    
+
     except Exception as e:
         logger.error(f"Error processing task for VID_ID {vid_id}: {e}")
         conn.rollback()
-    
     finally:
         logger.debug(f"Returning connection for VID_ID {vid_id}: {id(conn)}")
         db_pool.putconn(conn)
 
     results_packet = generate_results_packet(vid_id, results)
-
-    total_task_time=times['start']-time.time()
+    total_task_time = time.time() - times['start']
     times['total_task_time'] = total_task_time
     logger.info(f"Task processing times: {times}")
 
@@ -270,24 +278,23 @@ def generate_results_packet(vid_id, results):
         'results': [{'model_key': r['model_key']} for r in results]
     }
 
-def process_task(transcript_items, model_key, vid_id, n_gram_size, logger, conn=None):
+def process_task(transcript_items, model_key, vid_id, n_gram_size, logger):
     try:
         start_time = time.time()
-        if model_key not in model_dict:
-            models_to_load = [model_key]
-            loaded_models = load_model_from_db(conn, models_to_load, logger)
-            if not loaded_models or model_key not in loaded_models:
-                logger.error(f"Skipping processing for model {model_key} due to load failure")
-                return [], 0
-            model_dict.update(loaded_models)
-        
-        model = model_dict[model_key]
+
+        # Ensure the model is loaded
+        model = model_dict.get(model_key)
+        if not model:
+            raise ValueError(f"Model {model_key} not found in model_dict.")
+
+        # Process transcript items and calculate scores
         score = [model.score(item, ngram) for item, ngram in transcript_items if ngram]
         time_taken = time.time() - start_time
-        return score, time_taken
+
+        return {'model_key': model_key, 'score': score, 'time_taken': time_taken}
     except Exception as e:
         logger.error(f"Processing error for VID_ID {vid_id}, MODEL_KEY {model_key}: {e}")
-        return [], 0
+        return {'model_key': model_key, 'score': [], 'time_taken': 0}
 
 def load_model_from_db(conn, model_keys, logger):
     loaded_models = {}
@@ -446,11 +453,16 @@ class ProcessingClient(BaseClient):
 
     async def process_tasks(self):
         while self.client_state == 'play':
-            times={}
+            times = {}
             times['start'] = time.time()
-            results_packet = handle_task_packet(self.db_pool, current_task, self.logger,times)
+            
+            # Await the asynchronous handle_task_packet function
+            results_packet = await handle_task_packet(self.db_pool, current_task, self.logger, times)
+            
             self.logger.info(f'Processing complete. Got results packet with {len(results_packet["results"])} results.')
-            await asyncio.sleep(0.1)  # Yield to allow packet processing
+            
+            # Yield to allow other tasks to run
+            await asyncio.sleep(0.1)
         
         self.logger.info('Client paused or stopped. Exiting task processing.')
 
