@@ -242,7 +242,7 @@ async def handle_task_packet(db_pool, packet, logger, times):
         times['save_results_time'] = get_save_results_time
 
         get_mark_tasks_complete_start = time.time()
-        mark_tasks_complete(vid_id, results, logger, conn=None)
+        mark_tasks_complete(vid_id, results, logger, conn)
         get_mark_tasks_complete_time= time.time() - get_mark_tasks_complete_start
         times['mark_tasks_complete_time'] = get_mark_tasks_complete_time
 
