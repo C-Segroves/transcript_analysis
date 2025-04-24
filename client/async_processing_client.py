@@ -241,6 +241,11 @@ async def handle_task_packet(db_pool, packet, logger, times):
         get_save_results_time = time.time() - get_save_results_start
         times['save_results_time'] = get_save_results_time
 
+        get_mark_tasks_complete_start = time.time()
+        mark_tasks_complete(vid_id, results, logger, conn=None)
+        get_mark_tasks_complete_time= time.time() - get_mark_tasks_complete_start
+        times['mark_tasks_complete_time'] = get_mark_tasks_complete_time
+
     except Exception as e:
         logger.error(f"Error processing task for VID_ID {vid_id}: {e}")
         conn.rollback()
