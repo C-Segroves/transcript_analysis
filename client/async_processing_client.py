@@ -56,7 +56,7 @@ DB_CONFIG = load_config()
 
 def setup_logger(log_file_path):
     logger = logging.getLogger('ProcessingClient')
-    logger.setLevel(logging.DEBUG)#logging.DEBUG#logging.INFO
+    logger.setLevel(logging.INFO)#logging.DEBUG#logging.INFO
     ch = logging.StreamHandler()
     ch.setLevel(logging.DEBUG)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -328,7 +328,7 @@ def load_model_from_db(conn, model_keys, logger):
             try:
                 if isinstance(model_data, memoryview):
                     model_data = model_data.tobytes()
-                    logger.info(f"Converted memoryview to bytes for {model_key}")
+                    logger.debug(f"Converted memoryview to bytes for {model_key}")
                 elif not isinstance(model_data, bytes):
                     logger.error(f"Model data for {model_key} is not bytes or memoryview: {type(model_data)}")
                     continue
