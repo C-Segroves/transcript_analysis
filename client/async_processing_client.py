@@ -18,15 +18,17 @@ import task_processor as tp
 
 from aiomultiprocess import Pool
 
+def check_platform_and_import_wmi():
+    print(platform.system())
+    if platform.system() == "Windows":
+        try:
+            import wmi
+            print("WMI library loaded successfully.")
+        except ImportError as e:
+            print(f"Failed to import WMI: {e}")
+    else:
+        print("WMI is not required on non-Windows platforms.")
 
-if platform.system() == "Windows":
-    try:
-        import wmi
-        print("WMI library loaded successfully.")
-    except ImportError as e:
-        print(f"Failed to import WMI: {e}")
-else:
-    print("WMI is not required on non-Windows platforms.")
 
 
 import psutil
@@ -54,7 +56,7 @@ DB_CONFIG = load_config()
 
 def setup_logger(log_file_path):
     logger = logging.getLogger('ProcessingClient')
-    logger.setLevel(logging.INFO)#logging.DEBUG
+    logger.setLevel(logging.INFO)#logging.DEBUG#logging.INFO
     ch = logging.StreamHandler()
     ch.setLevel(logging.DEBUG)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -220,6 +222,7 @@ async def handle_task_packet(db_pool, packet, logger, times):
             # Load missing models outside of process_task
             missing_models = [key for key in model_keys if key not in model_dict]
             if missing_models:
+                logger.info(f"Loading missing models: {missing_models}")
                 loaded_models = load_model_from_db(conn, missing_models, logger)
                 model_dict.update(loaded_models)
 
@@ -325,7 +328,7 @@ def load_model_from_db(conn, model_keys, logger):
             try:
                 if isinstance(model_data, memoryview):
                     model_data = model_data.tobytes()
-                    logger.info(f"Converted memoryview to bytes for {model_key}")
+                    logger.debug(f"Converted memoryview to bytes for {model_key}")
                 elif not isinstance(model_data, bytes):
                     logger.error(f"Model data for {model_key} is not bytes or memoryview: {type(model_data)}")
                     continue
@@ -340,7 +343,7 @@ def load_model_from_db(conn, model_keys, logger):
                     continue
                 
                 loaded_models[model_key] = model
-                logger.info(f"Successfully loaded NLTK model {model_key} from database. Type: {type(model)}")
+                logger.debug(f"Successfully loaded NLTK model {model_key} from database. Type: {type(model)}")
             
             except pickle.PickleError as e:
                 logger.error(f"Pickle deserialization error for model {model_key}: {e}")
@@ -516,6 +519,7 @@ class ProcessingClient(BaseClient):
         self.client_state = 'shutdown'
 
 if __name__ == "__main__":
+    check_platform_and_import_wmi()
     config = load_config()
     logger = setup_logger('')
 
