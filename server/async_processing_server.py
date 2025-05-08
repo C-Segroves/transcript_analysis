@@ -155,7 +155,7 @@ class ProcessingServer(BaseServer):
                     self.writers.discard(writer)  # Remove client on error
 
             self.logger.info("Hourly health check completed.")
-            await asyncio.sleep(600)  # Wait for <- that amount over there before the next health check #3600
+            await asyncio.sleep(3600)  # Wait for <- that amount over there before the next health check #3600
 
     async def start(self):
         server = await asyncio.start_server(

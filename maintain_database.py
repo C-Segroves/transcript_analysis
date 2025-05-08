@@ -253,6 +253,37 @@ def insert_initial_vid_model_states(db_params, logger:logging.Logger):
             cur.executemany(insert_query, assignments)
             conn.commit()
 
+def reset_pending_states_and_cluster(db_params, logger: logging.Logger):
+    """
+    Resets all 'pending' states in the VID_MODEL_STATE table to NULL
+    and clusters the table on VID_ID.
+    """
+    reset_query = """
+    UPDATE VID_MODEL_STATE
+    SET STATE = NULL
+    WHERE STATE = 'pending';
+    """
+    
+    cluster_query = """
+    CLUSTER VID_MODEL_STATE USING vid_model_state_vid_id_idx;
+    """
+    
+    with psycopg2.connect(**db_params) as conn:
+        with conn.cursor() as cur:
+            try:
+                logger.info("Resetting 'pending' states to NULL in VID_MODEL_STATE table.")
+                cur.execute(reset_query)
+                conn.commit()
+                logger.info("Successfully reset 'pending' states.")
+
+                logger.info("Clustering VID_MODEL_STATE table on VID_ID.")
+                cur.execute(cluster_query)
+                conn.commit()
+                logger.info("Successfully clustered VID_MODEL_STATE table.")
+            except Exception as e:
+                logger.error(f"Error resetting states or clustering table: {e}")
+                conn.rollback()
+
 def maintain_database(api_key_path, logger:logging.Logger):
     db_params = load_db_config()
     api_key = get_api_key(api_key_path)
@@ -280,6 +311,9 @@ def maintain_database(api_key_path, logger:logging.Logger):
 
     # Add initial states for new VID_IDs with transcripts
     insert_initial_vid_model_states(db_params,logger)
+
+    # Reset pending states and cluster the table
+    reset_pending_states_and_cluster(db_params,logger)
 
     logger.info("Database maintenance completed.")
 

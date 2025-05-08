@@ -226,6 +226,7 @@ async def handle_task_packet(db_pool, packet, logger, times):
                 loaded_models = load_model_from_db(conn, missing_models, logger)
                 model_dict.update(loaded_models)
 
+            get_parallel_start = time.time()
             # Use aiomultiprocess to process tasks in parallel
             async with Pool() as pool:
                 tasks = [
@@ -237,6 +238,8 @@ async def handle_task_packet(db_pool, packet, logger, times):
                     for model_key in model_keys
                 ]
                 results = await asyncio.gather(*tasks)
+            get_parallel_time = time.time() - get_parallel_start
+            times['get_parallel_time'] = get_parallel_time
 
         # Save results to the database
         get_save_results_start = time.time()
