@@ -108,7 +108,7 @@ def get_pending_tasks(logger, batch_size=100, n_gram_size=4, conn=None):
     try:
         logger.info('Attempting to get pending tasks from database.')
         cursor = conn.cursor()
-        get_vid_id_query = "SELECT VID_ID FROM VID_MODEL_STATE WHERE STATE IS NULL LIMIT 1"
+        get_vid_id_query = "SELECT VID_ID FROM VID_MODEL_STATE WHERE STATE IS NULL LIMIT 1" #TODO: change this to use new task table for island tasks
         cursor.execute(get_vid_id_query)
         vid_ids = [row[0] for row in cursor.fetchall()]
         if not vid_ids:

@@ -6,7 +6,7 @@ import json
 import time
 from datetime import datetime
 import re
-from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled, IpBlocked
 import os
 import logging
 
@@ -194,13 +194,13 @@ def insert_new_transcripts(db_params, logger:logging.Logger):
             for vid_id in needed_transcript_vid_id_df['vid_id']:
                 logger.info(f"Processing transcript for {vid_id}")
                 try:
-                    time.sleep(0.125)
-                    transcript_info_list = YouTubeTranscriptApi.get_transcript(vid_id)
+                    time.sleep(10)
+                    transcript_info_list = YouTubeTranscriptApi().fetch(vid_id,languages=['en'])#get_transcript(vid_id)
                     cum_word_count = 0
-                    for transcript_line in transcript_info_list:
-                        text = transcript_line['text']
-                        start = transcript_line['start']
-                        duration = transcript_line['duration']
+                    for transcript_line in transcript_info_list.snippets:
+                        text = transcript_line.text#  ['text']
+                        start = transcript_line.start #['start']
+                        duration = transcript_line.duration #['duration']
                         text_formatted = text.lower()
                         text_formatted = re.sub(r"\[.*\]|\{.*\}", "", text_formatted)
                         text_formatted = re.sub(r'[^\w\s]', "", text_formatted)
@@ -208,6 +208,10 @@ def insert_new_transcripts(db_params, logger:logging.Logger):
                         cum_word_count += word_count
                         cur.execute(insert_query, (vid_id, text, start, duration, text_formatted, word_count, cum_word_count, datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")))
                     conn.commit()
+                except IpBlocked:
+                    logger.error(f"IP block detected. Stopping transcript updates to avoid further blocks.")
+                    conn.commit()  # Commit any successful updates before breaking
+                    break  # Exit the loop to prevent further requests
                 except Exception as e:
                     logger.error(f"Error for {vid_id}: {e}")
                     cur.execute("SELECT COUNT(*) FROM VID_TRANSCRIPT_TABLE WHERE VID_ID = %s", (vid_id,))
@@ -253,6 +257,37 @@ def insert_initial_vid_model_states(db_params, logger:logging.Logger):
             cur.executemany(insert_query, assignments)
             conn.commit()
 
+def reset_pending_states_and_cluster(db_params, logger: logging.Logger):
+    """
+    Resets all 'pending' states in the VID_MODEL_STATE table to NULL
+    and clusters the table on VID_ID.
+    """
+    reset_query = """
+    UPDATE VID_MODEL_STATE
+    SET STATE = NULL
+    WHERE STATE = 'pending';
+    """
+    
+    cluster_query = """
+    CLUSTER VID_MODEL_STATE USING vid_model_state_vid_id_idx;
+    """
+    
+    with psycopg2.connect(**db_params) as conn:
+        with conn.cursor() as cur:
+            try:
+                logger.info("Resetting 'pending' states to NULL in VID_MODEL_STATE table.")
+                cur.execute(reset_query)
+                conn.commit()
+                logger.info("Successfully reset 'pending' states.")
+
+                logger.info("Clustering VID_MODEL_STATE table on VID_ID.")
+                cur.execute(cluster_query)
+                conn.commit()
+                logger.info("Successfully clustered VID_MODEL_STATE table.")
+            except Exception as e:
+                logger.error(f"Error resetting states or clustering table: {e}")
+                conn.rollback()
+
 def maintain_database(api_key_path, logger:logging.Logger):
     db_params = load_db_config()
     api_key = get_api_key(api_key_path)
@@ -280,6 +315,9 @@ def maintain_database(api_key_path, logger:logging.Logger):
 
     # Add initial states for new VID_IDs with transcripts
     insert_initial_vid_model_states(db_params,logger)
+
+    # Reset pending states and cluster the table
+    reset_pending_states_and_cluster(db_params,logger)
 
     logger.info("Database maintenance completed.")
 
