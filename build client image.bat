@@ -12,7 +12,7 @@ if %errorlevel% equ 0 (
     setlocal EnableDelayedExpansion
     for /f "tokens=*" %%i in ('hostname') do set HOST_NAME=%%i
     echo Hostname: !HOST_NAME!
-    docker run -it --name client-container --network transcript-network -e SERVER_HOST=server-container -e MACHINE_NAME=!HOST_NAME! my-client-image
+    docker run -it --name client-container --network transcript-network -e SERVER_HOST=192.168.1.204 -e MACHINE_NAME=!HOST_NAME! my-client-image
     endlocal
 ) else (
     echo Failed to build client image. Check the output for errors.

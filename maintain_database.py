@@ -6,7 +6,7 @@ import json
 import time
 from datetime import datetime
 import re
-from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled, IpBlocked
 import os
 import logging
 
@@ -194,13 +194,13 @@ def insert_new_transcripts(db_params, logger:logging.Logger):
             for vid_id in needed_transcript_vid_id_df['vid_id']:
                 logger.info(f"Processing transcript for {vid_id}")
                 try:
-                    time.sleep(0.125)
-                    transcript_info_list = YouTubeTranscriptApi.get_transcript(vid_id)
+                    time.sleep(10)
+                    transcript_info_list = YouTubeTranscriptApi().fetch(vid_id,languages=['en'])#get_transcript(vid_id)
                     cum_word_count = 0
-                    for transcript_line in transcript_info_list:
-                        text = transcript_line['text']
-                        start = transcript_line['start']
-                        duration = transcript_line['duration']
+                    for transcript_line in transcript_info_list.snippets:
+                        text = transcript_line.text#  ['text']
+                        start = transcript_line.start #['start']
+                        duration = transcript_line.duration #['duration']
                         text_formatted = text.lower()
                         text_formatted = re.sub(r"\[.*\]|\{.*\}", "", text_formatted)
                         text_formatted = re.sub(r'[^\w\s]', "", text_formatted)
@@ -208,6 +208,10 @@ def insert_new_transcripts(db_params, logger:logging.Logger):
                         cum_word_count += word_count
                         cur.execute(insert_query, (vid_id, text, start, duration, text_formatted, word_count, cum_word_count, datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")))
                     conn.commit()
+                except IpBlocked:
+                    logger.error(f"IP block detected. Stopping transcript updates to avoid further blocks.")
+                    conn.commit()  # Commit any successful updates before breaking
+                    break  # Exit the loop to prevent further requests
                 except Exception as e:
                     logger.error(f"Error for {vid_id}: {e}")
                     cur.execute("SELECT COUNT(*) FROM VID_TRANSCRIPT_TABLE WHERE VID_ID = %s", (vid_id,))

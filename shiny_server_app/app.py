@@ -5,6 +5,7 @@ import json
 import urllib.request
 from datetime import datetime
 import logging
+import requests
 
 # Configure logging
 logging.basicConfig(
@@ -63,15 +64,21 @@ def fetch_channel_details(channel_handle, api_key):
         url = f'https://www.googleapis.com/youtube/v3/channels?key={api_key}&forHandle={channel_handle}'
         with urllib.request.urlopen(url, timeout=1) as response:
             resp = json.load(response)
+            #logger.info(f"Response: {resp}")
+            #logger.info(f"Response: {resp['items']}")
+            #logger.info(f"Response: {resp['items']}")
             channel_id = resp['items'][0]['id']
         
-        logger.info("CHANNEL_ID: {channel_id}")
+        logger.info(f"CHANNEL_ID: {channel_id}")
 
         # Get channel metadata (snippet)
         channel_url = f'https://www.googleapis.com/youtube/v3/channels?key={api_key}&id={channel_id}&part=snippet'
         with urllib.request.urlopen(channel_url, timeout=1) as response:
             resp2 = json.load(response)
+            #logger.info(f"Response: {resp2}")
             snippet = resp2['items'][0]['snippet']
+        
+        logger.info(f"Snippet: {snippet}")
 
         return channel_id, snippet
     except Exception as e:
@@ -86,7 +93,10 @@ app_ui = ui.page_fluid(
     ui.h2("Add New Channel"),
     ui.input_text("channel_handle_input", "Channel Handle"),
     ui.input_action_button("add_channel_btn", "Add Channel"),
-    ui.output_text("add_channel_status")
+    ui.output_text("add_channel_status"),
+    ui.h2("Maintenance"),
+    ui.input_action_button("run_maintenance_btn", "Run Maintenance"),
+    ui.output_text("maintenance_status")
 )
 
 # Define the server logic
@@ -143,6 +153,7 @@ def server(input, output, session):
 
         #api_key = load_config()["api_key"]  # Load the API key from the config
         channel_id, snippet = fetch_channel_details(channel_handle, api_key)
+        logger.info(f"Channel ID to display: {channel_id}")
         if channel_id and snippet:
             try:
                 insert_new_channel(channel_handle, channel_id, snippet)

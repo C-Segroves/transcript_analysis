@@ -161,6 +161,40 @@ def create_vid_model_state_table(db_params):
     """
     execute_postgres_script(db_params, sql_script)
 
+def create_threshold_table(db_params):
+    sql_script = """
+    DROP TABLE IF EXISTS THRESHOLD_TABLE;
+    CREATE TABLE THRESHOLD_TABLE (
+        THRESHOLD_ID SERIAL PRIMARY KEY,
+        THRESHOLD_VALUE FLOAT NOT NULL,
+        DESCRIPTION VARCHAR(255),
+        CREATED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (THRESHOLD_VALUE)
+    );
+    """
+    execute_postgres_script(db_params, sql_script)
+
+def create_island_table(db_params):
+    sql_script = """
+    DROP TABLE IF EXISTS SCORE_ISLAND_TABLE;
+    CREATE TABLE SCORE_ISLAND_TABLE (
+    ISLAND_ID SERIAL PRIMARY KEY,
+    VID_ID VARCHAR(255) NOT NULL,
+    MODEL_KEY VARCHAR(255) NOT NULL,
+    THRESHOLD_ID INT NOT NULL,
+    START_INDEX INT NOT NULL,
+    END_INDEX INT NOT NULL,
+    ISLAND_LENGTH INT GENERATED ALWAYS AS (END_INDEX - START_INDEX + 1) STORED,
+    INSERT_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (VID_ID, MODEL_KEY) REFERENCES VID_SCORE_TABLE(VID_ID, MODEL_KEY),
+    FOREIGN KEY (THRESHOLD_ID) REFERENCES THRESHOLD_TABLE(THRESHOLD_ID),
+    CHECK (START_INDEX <= END_INDEX)
+    );
+    """
+    execute_postgres_script(db_params, sql_script)
+
+
+
 def create_indexes(db_params):
     indexes = [
         "CREATE INDEX IF NOT EXISTS transcript_table_id_wordcount_index ON VID_TRANSCRIPT_TABLE (VID_ID, WORD_COUNT);",
