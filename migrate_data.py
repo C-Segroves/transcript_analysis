@@ -28,7 +28,7 @@ def migrate_data():
         print("=" * 60)
 
         # Step 1: Migrate MODEL_TABLE
-        print("Step 1: Migrating MODEL_TABLE...")
+        print(f"Step 1: Migrating MODEL_TABLE...{datetime.now()}")
         model_map = {}
         cursor.execute("SELECT model_key, model_data, insert_at FROM model_table")
         model_count = 0
@@ -42,7 +42,7 @@ def migrate_data():
         print(f"   → Migrated {model_count} models")
 
         # Step 2: Migrate CHANNEL_TABLE
-        print("Step 2: Migrating CHANNEL_TABLE...")
+        print(f"Step 2: Migrating CHANNEL_TABLE...{datetime.now()}")
         channel_map = {}
         cursor.execute("SELECT channel_id, channel_handle, channel_snippet, insert_at FROM channel_table")
         channel_count = 0
@@ -57,7 +57,7 @@ def migrate_data():
         print(f"   → Migrated {channel_count} channels")
 
         # Step 3: Migrate VID_TABLE
-        print("Step 3: Migrating VID_TABLE...")
+        print(f"Step 3: Migrating VID_TABLE...{datetime.now()}")
         vid_map = {}
         cursor.execute("SELECT channel_id, vid_id, insert_at FROM vid_table")
         vid_count = 0
@@ -77,7 +77,7 @@ def migrate_data():
         print(f"   → Migrated {vid_count} videos ({skipped_vids} skipped)")
 
         # Step 4: Migrate VID_DATA_TABLE
-        print("Step 4: Migrating VID_DATA_TABLE...")
+        print(f"Step 4: Migrating VID_DATA_TABLE...{datetime.now()}")
         cursor.execute("""
             SELECT vid_id, title, description, publishtime, snippet, insert_at
             FROM vid_data_table
@@ -96,7 +96,7 @@ def migrate_data():
         print(f"   → Migrated {vid_data_count} video metadata records")
 
         # Step 5: Migrate VID_TRANSCRIPT_TABLE
-        print("Step 5: Migrating VID_TRANSCRIPT_TABLE...")
+        print(f"Step 5: Migrating VID_TRANSCRIPT_TABLE...{datetime.now()}")
         cursor.execute("""
             SELECT vid_id, text, start, duration, text_formatted, word_count, cum_word_count, insert_at
             FROM vid_transcript_table
@@ -127,24 +127,54 @@ def migrate_data():
         #    threshold_count += 1
         #print(f"   → Migrated {threshold_count} thresholds")
 
-        # Step 7: Migrate VID_SCORE_TABLE
-        print("Step 7: Migrating VID_SCORE_TABLE...")
-        cursor.execute("SELECT vid_id, model_key, score, insert_at FROM vid_score_table")
+        # ------------------------------------------------------------------
+        # Step 7 – VID_SCORE_TABLE (Memory-safe, batched)
+        # ------------------------------------------------------------------
+        print(f"Step 7: Migrating VID_SCORE_TABLE (batched, memory-safe)...{datetime.now()}")
+
+        BATCH_SIZE = 10_000
         score_count = 0
-        for old_vid_id, old_model_key, score, insert_at in cursor.fetchall():
-            new_vid_id = vid_map.get(old_vid_id)
-            new_model_id = model_map.get(old_model_key)
-            if not new_vid_id or not new_model_id:
-                continue
-            cursor.execute("""
-                INSERT INTO new_vid_score_table (vid_id, model_id, score, insert_at)
-                VALUES (%s, %s, %s, %s)
-            """, (new_vid_id, new_model_id, score, insert_at))
-            score_count += 1
-        print(f"   → Migrated {score_count} score records")
+        skipped_count = 0
+
+        # Use a named, server-side cursor
+        with connection.cursor(name='vid_score_cursor') as server_cursor:
+            server_cursor.itersize = BATCH_SIZE
+            server_cursor.execute("""
+                SELECT vid_id, model_key, score, insert_at 
+                FROM vid_score_table 
+                ORDER BY vid_id, model_key
+            """)
+
+            batch = []
+            while True:
+                rows = server_cursor.fetchmany(BATCH_SIZE)
+                if not rows:
+                    break
+
+                for old_vid_id, old_model_key, score, insert_at in rows:
+                    new_vid_id = vid_map.get(old_vid_id)
+                    new_model_id = model_map.get(old_model_key)
+                    if not new_vid_id or not new_model_id:
+                        skipped_count += 1
+                        continue
+                    batch.append((new_vid_id, new_model_id, score, insert_at))
+                    score_count += 1
+
+                # Insert batch
+                if batch:
+                    cursor.executemany("""
+                        INSERT INTO new_vid_score_table (vid_id, model_id, score, insert_at)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (vid_id, model_id) DO NOTHING
+                    """, batch)
+                    batch.clear()
+
+                print(f"   → Processed {score_count:,} score rows so far...", end='\r')
+
+        print(f"\n   → Migrated {score_count:,} score records ({skipped_count:,} skipped)")
 
         # Step 8: Migrate VID_SCORE_ANALYTICS_TABLE
-        print("Step 8: Migrating VID_SCORE_ANALYTICS_TABLE...")
+        print(f"Step 8: Migrating VID_SCORE_ANALYTICS_TABLE...{datetime.now()}")
         cursor.execute("SELECT vid_id, model_key, machine_name, time_taken, insert_at FROM vid_score_analytics_table")
         analytics_count = 0
         for old_vid_id, old_model_key, machine, time_taken, insert_at in cursor.fetchall():
@@ -160,7 +190,7 @@ def migrate_data():
         print(f"   → Migrated {analytics_count} analytics records")
 
         # Step 9: Migrate ASSIGNED_TASKS
-        print("Step 9: Migrating ASSIGNED_TASKS...")
+        print(f"Step 9: Migrating ASSIGNED_TASKS...{datetime.now()}")
         cursor.execute("SELECT vid_id, model_key FROM assigned_tasks")
         task_count = 0
         for old_vid_id, old_model_key in cursor.fetchall():
@@ -176,7 +206,7 @@ def migrate_data():
         print(f"   → Migrated {task_count} assigned tasks")
 
         # Step 10: Migrate VID_MODEL_STATE
-        print("Step 10: Migrating VID_MODEL_STATE...")
+        print(f"Step 10: Migrating VID_MODEL_STATE...{datetime.now()}")
         cursor.execute("SELECT vid_id, model_key, state FROM vid_model_state")
         state_count = 0
         for old_vid_id, old_model_key, state in cursor.fetchall():
