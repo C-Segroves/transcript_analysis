@@ -38,12 +38,9 @@ def setup_logger(log_file_path):
     return logger
 
 def clear_assigned_tasks(db_pool):
-    with db_pool.getconn() as conn:
-        logger.info('Server: clearing out old assigned tasks.')
-        cursor = conn.cursor()
-        cursor.execute("UPDATE VID_MODEL_STATE SET STATE = NULL WHERE STATE = 'pending';")
-        conn.commit()
-        db_pool.putconn(conn)
+    """No-op function - state column removed. Tasks are determined by checking transcripts and scores."""
+    logger.info('Server: clear_assigned_tasks called (no-op - state column removed)')
+    pass
 
 def generate_client_play_packet():
     return {"packet_type": "play", "additional_data": {}}
@@ -60,6 +57,7 @@ class ProcessingServer(BaseServer):
         self.writers = set()  # Track connected clients
         self.clients ={}
         self.server_state = 'running'
+        self.last_maintenance_hour = None  # Track last maintenance hour to prevent re-triggering
 
     async def send_data(self, data, writer):
         try:
@@ -99,45 +97,97 @@ class ProcessingServer(BaseServer):
         self.writers.discard(writer)  # Remove client when disconnected
         self.logger.info(f"Client disconnected. Active clients: {len(self.writers)}")
 
+    async def _run_maintenance(self, now):
+        """Helper method to run the maintenance process."""
+        self.logger.info(f"Maintenance triggered at {now}")
+        self.last_maintenance_hour = now.hour  # Mark that we've run maintenance this hour
+        self.server_state = 'maintenance'
+
+        # Send pause packets to all clients
+        self.logger.info(f"Sending pause packets to {len(self.writers)} clients")
+        pause_packet = generate_client_pause_packet()
+        for writer in self.writers.copy():
+            try:
+                logger.info(f"Sending {pause_packet} packet to {writer.get_extra_info('peername')}")
+                await self.send_data(pause_packet, writer)
+            except Exception as e:
+                self.logger.error(f"Failed to send pause to client: {e}")
+                self.writers.discard(writer)
+
+        # Run maintenance
+        self.logger.info("Running maintenance")
+        try:
+            await asyncio.to_thread(maintain_database.maintain_database, "/app/config/YouTube.txt", self.logger)
+        except Exception as e:
+            self.logger.error(f"Maintenance failed: {e}")
+
+        # Send play packets to all clients
+        self.logger.info(f"Sending play packets to {len(self.writers)} clients")
+        self.server_state = 'running'  # Fixed typo from 'run' to 'running'
+        play_packet = generate_client_play_packet()
+        for writer in self.writers.copy():
+            try:
+                await self.send_data(play_packet, writer)
+            except Exception as e:
+                self.logger.error(f"Failed to send play to client: {e}")
+                self.writers.discard(writer)
+        
+        self.logger.info(f"Maintenance completed at {datetime.now()}")
+
     async def maintenance_task(self):
-        """Runs at 22:56 local time: pauses clients, runs maintenance, resumes clients"""
-        while True:
-            now = datetime.now()
-            if now.hour == 4 and now.minute == 0:
-                self.logger.info(f"Maintenance triggered at {now}")
-                self.server_state = 'maintenance'
+        """Runs at 4:00 AM local time: pauses clients, runs maintenance, resumes clients"""
+        self.logger.info("Maintenance task started - will run at 4:00 AM local time")
+        startup_check_done = False
+        try:
+            while True:
+                now = datetime.now()
+                current_hour = now.hour
+                current_minute = now.minute
+                
+                # On first startup, check if we should run maintenance immediately
+                # (if it's past 4:00 AM and we haven't run today)
+                if not startup_check_done:
+                    startup_check_done = True
+                    self.logger.info(f"Startup check: Current time is {current_hour}:{current_minute:02d}, last_maintenance_hour={self.last_maintenance_hour}")
+                    # Run maintenance if:
+                    # 1. It's 4:00 AM or later (any time after 4:00 AM)
+                    # 2. We haven't run maintenance for hour 4 today
+                    if current_hour >= 4 and self.last_maintenance_hour != 4:
+                        self.logger.info(f"Startup check: It's {current_hour}:{current_minute:02d}, past 4:00 AM. Running maintenance now (missed scheduled time).")
+                        # Run maintenance immediately
+                        await self._run_maintenance(now)
+                        continue  # Skip to next iteration after running maintenance
+                    elif current_hour == 4 and current_minute < 2:
+                        # We're in the 4:00-4:02 window, let the normal check handle it
+                        self.logger.info(f"Startup check: It's {current_hour}:{current_minute:02d}, in the 4:00 AM window. Normal maintenance check will handle it.")
+                    else:
+                        self.logger.info(f"Startup check: Current time {current_hour}:{current_minute:02d}, maintenance will run at next 4:00 AM")
+                
+                # Log every hour on the hour to show the task is running
+                if current_minute == 0 and now.second < 30:
+                    self.logger.info(f"Maintenance task active - current time: {now.strftime('%Y-%m-%d %H:%M:%S')}, waiting for 4:00 AM")
+                
+                # Check if it's 4:00 AM (within the first 2 minutes) and we haven't run maintenance this hour
+                if current_hour == 4 and current_minute < 2 and self.last_maintenance_hour != current_hour:
+                    await self._run_maintenance(now)
+                elif current_hour != 4:
+                    # Reset the flag when we're past 4 AM to allow next day's run
+                    if self.last_maintenance_hour == 4:
+                        self.last_maintenance_hour = None
+                        self.logger.debug("Reset maintenance flag - ready for next day")
 
-                # Send pause packets to all clients
-                self.logger.info(f"Sending pause packets to {len(self.writers)} clients")
-                pause_packet = generate_client_pause_packet()
-                for writer in self.writers.copy():
-                    try:
-                        logger.info(f"Sending {pause_packet} packet to {writer.get_extra_info('peername')}")
-                        await self.send_data(pause_packet, writer)
-                    except Exception as e:
-                        self.logger.error(f"Failed to send pause to client: {e}")
-                        self.writers.discard(writer)
-
-                # Run maintenance
-                self.logger.info("Running maintenance")
-                try:
-                    await asyncio.to_thread(maintain_database.maintain_database, "/app/config/YouTube.txt", self.logger)
-                except Exception as e:
-                    self.logger.error(f"Maintenance failed: {e}")
-
-                # Send play packets to all clients
-                self.logger.info(f"Sending play packets to {len(self.writers)} clients")
-                self.server_state = 'running'  # Fixed typo from 'run' to 'running'
-                play_packet = generate_client_play_packet()
-                for writer in self.writers.copy():
-                    try:
-                        await self.send_data(play_packet, writer)
-                    except Exception as e:
-                        self.logger.error(f"Failed to send play to client: {e}")
-                        self.writers.discard(writer)
-
-            # Sleep to prevent tight loop
-            await asyncio.sleep(30)  # Check every 30 seconds
+                # Sleep to prevent tight loop
+                # Check more frequently around 4 AM to catch the trigger
+                if current_hour == 3 and current_minute >= 58:
+                    await asyncio.sleep(10)  # Check every 10 seconds when approaching 4 AM
+                elif current_hour == 4 and current_minute < 5:
+                    await asyncio.sleep(10)  # Check every 10 seconds during the first 5 minutes of 4 AM
+                else:
+                    await asyncio.sleep(30)  # Check every 30 seconds otherwise
+        except Exception as e:
+            self.logger.error(f"Critical error in maintenance_task: {e}", exc_info=True)
+            # Re-raise to let the caller know
+            raise
 
     async def health_check_task(self):
         """Runs every {some period} to send health_check packets to all clients."""

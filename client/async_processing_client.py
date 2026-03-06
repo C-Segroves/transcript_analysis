@@ -105,29 +105,48 @@ def generate_task_request_packet():
     return {'packet_type': 'task_request', 'additional_data': {}}
 
 def get_pending_tasks(logger, batch_size=100, n_gram_size=4, conn=None):
+    """Get pending tasks by finding videos with transcripts that don't have scores for some models."""
     try:
         logger.info('Attempting to get pending tasks from database.')
         cursor = conn.cursor()
-        get_vid_id_query = "SELECT VID_ID FROM VID_MODEL_STATE WHERE STATE IS NULL LIMIT 1"
+        # Find a video that has transcripts but is missing scores for some models
+        get_vid_id_query = """
+            SELECT DISTINCT v.vid_id
+            FROM vid_table v
+            INNER JOIN vid_transcript_table vt ON v.vid_id = vt.vid_id
+            WHERE vt.word_count > 0
+            AND EXISTS (
+                SELECT 1 FROM model_table m
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM vid_score_table vs
+                    WHERE vs.vid_id = v.vid_id AND vs.model_key = m.model_key
+                )
+            )
+            LIMIT 1
+        """
         cursor.execute(get_vid_id_query)
-        vid_ids = [row[0] for row in cursor.fetchall()]
-        if not vid_ids:
+        result = cursor.fetchone()
+        if not result:
             logger.info('No pending tasks found in database.')
             return None
-        vid_id = vid_ids[0]
+        vid_id = result[0]
 
         logger.info(f'VID_ID {vid_id} has been selected for processing.')
         
-        get_model_keys_query = "SELECT MODEL_KEY FROM VID_MODEL_STATE WHERE VID_ID = %s AND STATE IS NULL LIMIT %s"
+        # Get model keys that don't have scores for this video yet
+        get_model_keys_query = """
+            SELECT m.model_key
+            FROM model_table m
+            WHERE NOT EXISTS (
+                SELECT 1 FROM vid_score_table vs
+                WHERE vs.vid_id = %s AND vs.model_key = m.model_key
+            )
+            LIMIT %s
+        """
         cursor.execute(get_model_keys_query, (vid_id, batch_size))
         model_keys = [row[0] for row in cursor.fetchall()]
         num_model_keys = len(model_keys)
         model_keys = model_keys[0:min(batch_size, num_model_keys)]
-        assignments = [(vid_id, model_key) for model_key in model_keys]
-
-        assigned_task_query = "UPDATE VID_MODEL_STATE SET STATE = 'pending' WHERE VID_ID=%s AND MODEL_KEY=%s"
-        cursor.executemany(assigned_task_query, assignments)
-        conn.commit()
 
         pending_task = {
             'packet_type': 'task_packet',
@@ -140,13 +159,13 @@ def get_pending_tasks(logger, batch_size=100, n_gram_size=4, conn=None):
         logger.info(f'Pending task created:')
         return pending_task
     except psycopg2.Error as e:
-        logger.error(f"Database error fetching transcript for VID_ID {vid_id}: {e}")
+        logger.error(f"Database error fetching pending tasks: {e}")
         if "current transaction is aborted" in str(e).lower():
             logger.critical("Transaction aborted detected. Aborting client.")
             conn.rollback()
             sys.exit(1)
         conn.rollback()
-        return []
+        return None
     finally:
         cursor.close()
 
@@ -154,10 +173,10 @@ def get_transcript(vid_id, n_gram_size, conn=None):
     try:
         cursor = conn.cursor()
         query = """
-            SELECT TEXT 
-            FROM VID_TRANSCRIPT_TABLE 
-            WHERE VID_ID = %s AND WORD_COUNT > 0 
-            ORDER BY CUM_WORD_COUNT
+            SELECT text 
+            FROM vid_transcript_table 
+            WHERE vid_id = %s AND word_count > 0 
+            ORDER BY cum_word_count
         """
         cursor.execute(query, (vid_id,))
         transcript_bits = [str(row[0]) for row in cursor.fetchall()]
@@ -267,20 +286,12 @@ async def handle_task_packet(db_pool, packet, logger, times):
     return results_packet
 
 def mark_tasks_complete(vid_id, results, logger, conn=None):
-    with db_pool.getconn() as conn:
-        cursor = conn.cursor()
-        update_query = """
-            UPDATE VID_MODEL_STATE 
-            SET STATE = 'complete'
-            WHERE VID_ID = %s AND MODEL_KEY = %s
-        """
-        for result in results:
-            model_key = result['model_key']
-            cursor.execute(update_query, (vid_id, model_key))
-        conn.commit()
-        num_models = len(results)
-        db_pool.putconn(conn)
-        logger.info(f"Task completed for VID_ID: {vid_id} for {num_models} models.")
+    """No-op function - state column removed. Completion is tracked by presence of scores in vid_score_table."""
+    # Tasks are considered complete when scores are saved to vid_score_table
+    # This function is kept for API compatibility but does nothing
+    num_models = len(results)
+    logger.info(f"Task completed for VID_ID: {vid_id} for {num_models} models (scores saved to vid_score_table).")
+    pass
 
 def generate_results_packet(vid_id, results):
     return {
@@ -372,10 +383,10 @@ def save_results(vid_id, results, conn=None):
     try:
         cursor = conn.cursor()
         score_query = """
-            INSERT INTO VID_SCORE_TABLE (VID_ID, MODEL_KEY, SCORE, INSERT_AT) 
+            INSERT INTO vid_score_table (vid_id, model_key, score, insert_at) 
             VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (VID_ID, MODEL_KEY) 
-            DO UPDATE SET SCORE = EXCLUDED.SCORE, INSERT_AT = CURRENT_TIMESTAMP
+            ON CONFLICT (vid_id, model_key) 
+            DO UPDATE SET score = EXCLUDED.score, insert_at = CURRENT_TIMESTAMP
         """
         for result in results:
             cursor.execute(score_query, (vid_id, result['model_key'], result['score']))

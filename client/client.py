@@ -87,6 +87,21 @@ async def load_model_from_db(conn, model_key):
     except Exception as e:
         logger.error(f"Unexpected error loading model {model_key}: {e}")
         return None
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
     finally:
         try:
             cursor.close()
@@ -105,10 +120,10 @@ def get_transcript(db_pool, vid_id, n_gram_size):
         try:
             cursor = conn.cursor()
             query = """
-                SELECT TEXT 
-                FROM VID_TRANSCRIPT_TABLE 
-                WHERE VID_ID = %s AND WORD_COUNT > 0 
-                ORDER BY CUM_WORD_COUNT
+                SELECT text 
+                FROM vid_transcript_table 
+                WHERE vid_id = %s AND word_count > 0 
+                ORDER BY cum_word_count
             """
             cursor.execute(query, (vid_id,))
             transcript_bits = [str(row[0]) for row in cursor.fetchall()]
@@ -153,10 +168,10 @@ def save_results(db_pool, vid_id, results):
         try:
             cursor = conn.cursor()
             score_query = """
-                INSERT INTO VID_SCORE_TABLE (VID_ID, MODEL_KEY, SCORE, INSERT_AT) 
+                INSERT INTO vid_score_table (vid_id, model_key, score, insert_at) 
                 VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
-                ON CONFLICT (VID_ID, MODEL_KEY) 
-                DO UPDATE SET SCORE = EXCLUDED.SCORE, INSERT_AT = CURRENT_TIMESTAMP
+                ON CONFLICT (vid_id, model_key) 
+                DO UPDATE SET score = EXCLUDED.score, insert_at = CURRENT_TIMESTAMP
             """
             for result in results:
                 cursor.execute(score_query, (vid_id, result['model_key'], result['score']))

@@ -26,35 +26,55 @@ db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, **DB_CONFIG)  # Global poo
 
 
 def clear_assigned_tasks(db_pool):
-    with db_pool.getconn() as conn:
-        logger.info('Server: clearing out old assigned tasks.')
-        cursor = conn.cursor()
-        cursor.execute("UPDATE VID_MODEL_STATE SET STATE = NULL WHERE STATE = 'pending';")
-        conn.commit()
-        db_pool.putconn(conn)
+    """No-op function - state column removed. Tasks are determined by checking transcripts and scores."""
+    logger.info('Server: clear_assigned_tasks called (no-op - state column removed)')
+    pass
 
 def get_pending_tasks(db_pool, batch_size=66, n_gram_size=4):
+    """Get pending tasks by finding videos with transcripts that don't have scores for some models."""
     with db_pool.getconn() as conn:
         cursor = conn.cursor()
-        get_vid_id_query = "SELECT VID_ID FROM VID_MODEL_STATE WHERE STATE IS NULL LIMIT 1"
+        # Find a video that has transcripts but is missing scores for some models
+        get_vid_id_query = """
+            SELECT DISTINCT v.vid_id
+            FROM vid_table v
+            INNER JOIN vid_transcript_table vt ON v.vid_id = vt.vid_id
+            WHERE vt.word_count > 0
+            AND EXISTS (
+                SELECT 1 FROM model_table m
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM vid_score_table vs
+                    WHERE vs.vid_id = v.vid_id AND vs.model_key = m.model_key
+                )
+            )
+            LIMIT 1
+        """
         cursor.execute(get_vid_id_query)
-        vid_ids = [row[0] for row in cursor.fetchall()]
-        if not vid_ids:
+        result = cursor.fetchone()
+        if not result:
             db_pool.putconn(conn)
             return None
-        vid_id = vid_ids[0]
+        vid_id = result[0]
         
-        get_model_keys_query = "SELECT MODEL_KEY FROM VID_MODEL_STATE WHERE VID_ID = %s AND STATE IS NULL LIMIT %s"
+        # Get model keys that don't have scores for this video yet
+        get_model_keys_query = """
+            SELECT m.model_key
+            FROM model_table m
+            WHERE NOT EXISTS (
+                SELECT 1 FROM vid_score_table vs
+                WHERE vs.vid_id = %s AND vs.model_key = m.model_key
+            )
+            LIMIT %s
+        """
         cursor.execute(get_model_keys_query, (vid_id, batch_size))
         model_keys = [row[0] for row in cursor.fetchall()]
         num_model_keys = len(model_keys)
         model_keys = model_keys[0:min(batch_size, num_model_keys)]
-        assignments = [(vid_id, model_key) for model_key in model_keys]
         
-        assigned_task_query = "UPDATE VID_MODEL_STATE SET STATE = 'pending' WHERE VID_ID=%s AND MODEL_KEY=%s"
-        cursor.executemany(assigned_task_query, assignments)
-        conn.commit()
         db_pool.putconn(conn)
+
+        if not model_keys:
+            return None
 
         pending_task = {
             'packet_type': 'task_packet',
@@ -67,19 +87,10 @@ def get_pending_tasks(db_pool, batch_size=66, n_gram_size=4):
         return pending_task
 
 def mark_tasks_complete(db_pool, vid_id, results):
-    with db_pool.getconn() as conn:
-        cursor = conn.cursor()
-        update_query = """
-            UPDATE VID_MODEL_STATE 
-            SET STATE = 'complete'
-            WHERE VID_ID = %s AND MODEL_KEY = %s
-        """
-        for result in results:
-            model_key = result['model_key']
-            cursor.execute(update_query, (vid_id, model_key))
-            #logger.info(f"Task completed for VID_ID: {vid_id}, MODEL_KEY: {model_key}")
-        conn.commit()
-        db_pool.putconn(conn)
+    """No-op function - state column removed. Completion is tracked by presence of scores in vid_score_table."""
+    # Tasks are considered complete when scores are saved to vid_score_table
+    # This function is kept for API compatibility but does nothing
+    pass
 
 async def run_maintenance( api_key_path):
     while True:
