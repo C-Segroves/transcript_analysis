@@ -12,6 +12,7 @@ from datetime import datetime, time
 
 from async_server import BaseServer
 import maintain_database
+import dashboard
 
 def load_config():
     try:
@@ -242,6 +243,20 @@ if __name__ == "__main__":
     server = ProcessingServer(host, port, logger, config)
 
     clear_assigned_tasks(db_pool)
-    
+
+    # Start the web dashboard (stats + add-channel) in a background thread so a
+    # single container serves both the task server (5000) and the web UI.
+    dashboard_port = int(os.getenv("DASHBOARD_PORT", "8080"))
+    try:
+        dashboard.start_dashboard_in_thread(
+            DB_CONFIG,
+            api_key_path="config/YouTube.txt",
+            logger=logger,
+            host="0.0.0.0",
+            port=dashboard_port,
+        )
+    except Exception as e:
+        logger.error(f"Failed to start dashboard web UI: {e}")
+
     logger.info("Starting ProcessingServer")
     asyncio.run(server.start())

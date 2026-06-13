@@ -9,7 +9,8 @@ if %errorlevel% equ 0 (
     echo Creating network if it doesn't exist...
     docker network create transcript-network 2>nul
     echo Running Server Image...
-    docker run -d --name server-container --network transcript-network -p 5000:5000 my-server-image
+    echo Dashboard will be available at http://localhost:8080
+    docker run -d --name server-container --network transcript-network -p 5000:5000 -p 8080:8080 my-server-image
 ) else (
     echo Failed to build server image. Check the output for errors.
 )
