@@ -30,9 +30,9 @@ def main():
     logger.info("\n" + "=" * 80)
     logger.info("DATABASE MIGRATION TEST SUITE")
     logger.info("=" * 80)
-    logger.info("\nThis test suite verifies that all functions work correctly")
-    logger.info("with the database schema. Most tests use transactions")
-    logger.info("with rollback to avoid permanent changes.\n")
+    logger.info("\nThe client / async-client / server suites are OFFLINE unit tests")
+    logger.info("(no database or network needed). The maintain_database suite is a")
+    logger.info("live-DB test and only runs when RUN_DB_TESTS=1 is set.\n")
     
     results = {}
     
@@ -60,13 +60,18 @@ def main():
         logger.error(f"Failed to import/run server tests: {e}")
         results['Server Functions'] = False
     
-    # Test maintain_database functions
-    try:
-        from test_maintain_database_functions import run_all_tests as test_maintain
-        results['Maintain Database Functions'] = run_test_suite("Maintain Database Functions Tests", test_maintain)
-    except Exception as e:
-        logger.error(f"Failed to import/run maintain_database tests: {e}")
-        results['Maintain Database Functions'] = False
+    # Test maintain_database functions (LIVE DB - opt in with RUN_DB_TESTS=1).
+    # The client/async-client/server suites above are fully offline; the
+    # maintain_database suite still talks to the real database.
+    if os.getenv("RUN_DB_TESTS"):
+        try:
+            from test_maintain_database_functions import run_all_tests as test_maintain
+            results['Maintain Database Functions'] = run_test_suite("Maintain Database Functions Tests", test_maintain)
+        except Exception as e:
+            logger.error(f"Failed to import/run maintain_database tests: {e}")
+            results['Maintain Database Functions'] = False
+    else:
+        logger.info("Skipping live-DB maintain_database tests (set RUN_DB_TESTS=1 to run them).")
     
     # Print summary
     logger.info("\n" + "=" * 80)

@@ -290,6 +290,67 @@ def _esc(s):
     return html.escape(str(s))
 
 
+def render_workers_section(snapshot):
+    if not snapshot:
+        return ""  # no status provider wired in (e.g. dashboard run standalone)
+
+    total = snapshot.get("total_models", 0) or 0
+    completed = snapshot.get("completed_models", 0) or 0
+    busy = snapshot.get("busy_models", 0) or 0
+    pct = f"{(completed / total) * 100:.1f}%" if total else "—"
+    cards = [
+        ("Active workers", snapshot.get("active_clients"), f"server: {_esc(snapshot.get('server_state', '?'))}"),
+        ("Models complete", completed, f"{pct} of {_fmt(total)}"),
+        ("Models in progress", busy, "currently owned by a worker"),
+        ("Models idle", max(total - completed - busy, 0), "available to assign"),
+    ]
+    card_html = "\n".join(
+        f"""
+        <div class="card">
+          <div class="card-label">{_esc(label)}</div>
+          <div class="card-value">{_fmt(value)}</div>
+          <div class="card-sub">{sub}</div>
+        </div>"""
+        for label, value, sub in cards
+    )
+
+    clients = snapshot.get("clients", []) or []
+    if not clients:
+        rows = '<tr><td colspan="4" class="muted">No clients connected.</td></tr>'
+    else:
+        def fmt_ids(ids):
+            ids = list(ids or [])
+            if not ids:
+                return '<span class="muted">—</span>'
+            shown = ", ".join(str(i) for i in ids[:12])
+            if len(ids) > 12:
+                shown += f" <span class=\"muted\">(+{len(ids) - 12})</span>"
+            return shown
+        rows = "\n".join(
+            f"""<tr>
+              <td>{_esc(c.get('machine_name', '?'))}</td>
+              <td>{fmt_ids(c.get('assigned'))}</td>
+              <td>{fmt_ids(c.get('loaded'))}</td>
+              <td class="num">{_fmt(c.get('scored', 0))}</td>
+            </tr>"""
+            for c in clients
+        )
+
+    return f"""
+  <h2>Workers</h2>
+  <div class="cards">
+    {card_html}
+  </div>
+  <table>
+    <thead>
+      <tr><th>Machine</th><th>Assigned models</th><th>Loaded models</th><th class="num">Scored</th></tr>
+    </thead>
+    <tbody>
+      {rows}
+    </tbody>
+  </table>"""
+
+
 def render_island_section(island_stats):
     if not island_stats or not island_stats.get("available"):
         return """
@@ -323,7 +384,7 @@ def render_island_section(island_stats):
   </div>"""
 
 
-def render_page(stats, channels, message=None, message_ok=True, island_stats=None):
+def render_page(stats, channels, message=None, message_ok=True, island_stats=None, worker_snapshot=None):
     pct = ""
     if stats.get("transcripts_downloaded") and stats.get("videos_processed") is not None:
         try:
@@ -383,6 +444,7 @@ def render_page(stats, channels, message=None, message_ok=True, island_stats=Non
         rows_html = "\n".join(rows)
 
     island_section = render_island_section(island_stats)
+    workers_section = render_workers_section(worker_snapshot)
 
     banner = ""
     if message:
@@ -447,6 +509,7 @@ def render_page(stats, channels, message=None, message_ok=True, island_stats=Non
   <div class="cards">
     {card_html}
   </div>
+{workers_section}
 {island_section}
 
   <h2>Add a channel</h2>
@@ -480,7 +543,7 @@ def render_page(stats, channels, message=None, message_ok=True, island_stats=Non
 # HTTP handler
 # ---------------------------------------------------------------------------
 
-def make_handler(db_config, api_key_path, logger):
+def make_handler(db_config, api_key_path, logger, status_provider=None):
 
     class DashboardHandler(BaseHTTPRequestHandler):
         server_version = "TranscriptDashboard/1.0"
@@ -501,8 +564,14 @@ def make_handler(db_config, api_key_path, logger):
             stats = fetch_stats(db_config, logger)
             channels = fetch_channels(db_config, logger)
             island_stats = fetch_island_stats(db_config, logger)
+            worker_snapshot = None
+            if status_provider is not None:
+                try:
+                    worker_snapshot = status_provider()
+                except Exception as e:
+                    logger.error(f"Dashboard: status_provider failed: {e}")
             self._send_html(
-                render_page(stats, channels, message, message_ok, island_stats), status
+                render_page(stats, channels, message, message_ok, island_stats, worker_snapshot), status
             )
 
         def do_GET(self):
@@ -539,12 +608,17 @@ def make_handler(db_config, api_key_path, logger):
 # ---------------------------------------------------------------------------
 
 def start_dashboard_in_thread(db_config, api_key_path=DEFAULT_API_KEY_PATH,
-                              logger=None, host="0.0.0.0", port=8080):
-    """Start the dashboard HTTP server in a daemon thread. Returns the server."""
+                              logger=None, host="0.0.0.0", port=8080, status_provider=None):
+    """Start the dashboard HTTP server in a daemon thread. Returns the server.
+
+    status_provider: optional zero-arg callable returning the server's worker
+    snapshot dict (rendered as the Workers section). When omitted, that section
+    is hidden.
+    """
     if logger is None:
         logger = logging.getLogger("Dashboard")
 
-    handler = make_handler(db_config, api_key_path, logger)
+    handler = make_handler(db_config, api_key_path, logger, status_provider)
     httpd = ThreadingHTTPServer((host, port), handler)
 
     thread = threading.Thread(

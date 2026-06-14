@@ -1,218 +1,142 @@
 """
-Test script for server/server.py functions.
-Uses transactions with rollback to avoid permanent database changes.
+Offline unit tests for the model-major coordination in
+server/async_processing_server.py (ProcessingServer).
+
+No database or network required. Verifies the in-memory assignment logic:
+  * pick_model_for: no model assigned to two clients at once
+  * resume: a client that already owns an unfinished model gets it back
+  * affinity: prefer a model the client already has loaded
+  * handle_model_complete marks completion and frees the model
+  * release_client frees a disconnected client's models
+  * get_worker_snapshot reports sane counts
+
+Run directly:  python test_server_functions.py
+Or via:        python run_all_tests.py
 """
 
-import sys
 import os
-import json
-import psycopg2
-from psycopg2 import pool
+import sys
 import logging
 
-# Add parent directory to path
 root_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, root_dir)
-sys.path.insert(0, os.path.join(root_dir, 'server'))
+sys.path.insert(0, os.path.join(root_dir, "server"))
 
-# Mock packet_handler before importing server
-try:
-    import test_mock_packet_handler
-except ImportError:
-    pass
+import test_support as ts
+ts.ensure_stubs()
 
-# Import server module
-import importlib.util
-server_path = os.path.join(root_dir, 'server', 'server.py')
-spec = importlib.util.spec_from_file_location("server_module", server_path)
-server = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(server)
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# async_processing_server imports maintain_database (heavy) and dashboard; stub
+# maintain_database so the import is light. dashboard imports cleanly (stdlib +
+# psycopg2, already handled by ensure_stubs).
+import types as _types
 
 
-def load_db_config():
-    with open('config/db_config.json', 'r') as f:
-        return json.load(f)
-
-
-def test_clear_assigned_tasks():
-    """Test clearing assigned tasks."""
-    logger.info("=" * 60)
-    logger.info("Testing clear_assigned_tasks()")
-    logger.info("=" * 60)
-    
-    db_params = load_db_config()
-    db_pool = pool.ThreadedConnectionPool(1, 5, **db_params)
-    
+def _stub_module_if_unimportable(name, build):
+    if name in sys.modules:
+        return
     try:
-        conn = db_pool.getconn()
-        conn.autocommit = False
-        
-        try:
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                UPDATE VID_MODEL_STATE 
-                SET STATE = 'pending'
-                WHERE STATE IS NULL
-                LIMIT 5
-            """)
-            pending_count = cursor.rowcount
-            conn.commit()
-            
-            if pending_count > 0:
-                logger.info(f"Set {pending_count} tasks to 'pending' state for testing")
-                
-                server.clear_assigned_tasks(db_pool)
-                
-                cursor.execute("""
-                    SELECT COUNT(*) 
-                    FROM VID_MODEL_STATE 
-                    WHERE STATE = 'pending'
-                """)
-                remaining = cursor.fetchone()[0]
-                
-                if remaining == 0:
-                    logger.info("✓ Successfully cleared all pending tasks")
-                    logger.info("✓ Test PASSED")
-                else:
-                    logger.error(f"✗ {remaining} pending tasks still remain")
-                    logger.error("✗ Test FAILED")
-            else:
-                logger.warning("⚠ No tasks to set to pending - skipping test")
-            
-            conn.rollback()
-            logger.info("✓ Transaction rolled back - no permanent changes")
-            
-        finally:
-            db_pool.putconn(conn)
-            
-    except Exception as e:
-        logger.error(f"Error in test_clear_assigned_tasks: {e}", exc_info=True)
-    finally:
-        db_pool.closeall()
+        __import__(name)
+    except Exception:
+        sys.modules[name] = build()
 
 
-def test_get_pending_tasks():
-    """Test getting pending tasks."""
-    logger.info("\n" + "=" * 60)
-    logger.info("Testing get_pending_tasks()")
-    logger.info("=" * 60)
-    
-    db_params = load_db_config()
-    db_pool = pool.ThreadedConnectionPool(1, 5, **db_params)
-    
-    try:
-        task = server.get_pending_tasks(db_pool, batch_size=10, n_gram_size=4)
-        
-        if task:
-            logger.info("✓ Successfully retrieved pending task")
-            logger.info(f"  Packet type: {task['packet_type']}")
-            logger.info(f"  Video ID: {task['additional_data']['vid_id']}")
-            logger.info(f"  Model keys count: {len(task['additional_data']['model_keys'])}")
-            logger.info(f"  N-gram size: {task['additional_data']['n_gram_size']}")
-            logger.info("✓ Test PASSED")
-        elif task is None:
-            logger.warning("⚠ No pending tasks available - this is expected if database is empty")
-            logger.info("✓ Test PASSED (no tasks to process)")
-        else:
-            logger.error("✗ Unexpected return value")
-            logger.error("✗ Test FAILED")
-        
-    except Exception as e:
-        logger.error(f"Error in test_get_pending_tasks: {e}", exc_info=True)
-    finally:
-        db_pool.closeall()
+def _build_maintain():
+    m = _types.ModuleType("maintain_database")
+    m.maintain_database = lambda *a, **k: None
+    return m
 
 
-def test_mark_tasks_complete():
-    """Test marking tasks as complete."""
-    logger.info("\n" + "=" * 60)
-    logger.info("Testing mark_tasks_complete()")
-    logger.info("=" * 60)
-    
-    db_params = load_db_config()
-    db_pool = pool.ThreadedConnectionPool(1, 5, **db_params)
-    
-    try:
-        conn = db_pool.getconn()
-        conn.autocommit = False
-        
-        try:
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT VID_ID, MODEL_KEY
-                FROM VID_MODEL_STATE
-                WHERE STATE IS NULL
-                LIMIT 1
-            """)
-            result = cursor.fetchone()
-            
-            if result:
-                vid_id = result[0]
-                model_key = result[1]
-                
-                logger.info(f"Testing with video {vid_id}, model {model_key}")
-                
-                cursor.execute("""
-                    UPDATE VID_MODEL_STATE 
-                    SET STATE = 'pending'
-                    WHERE VID_ID = %s AND MODEL_KEY = %s
-                """, (vid_id, model_key))
-                conn.commit()
-                
-                results = [{'model_key': model_key}]
-                server.mark_tasks_complete(db_pool, vid_id, results)
-                
-                cursor.execute("""
-                    SELECT STATE
-                    FROM VID_MODEL_STATE
-                    WHERE VID_ID = %s AND MODEL_KEY = %s
-                """, (vid_id, model_key))
-                
-                state_result = cursor.fetchone()
-                
-                if state_result and state_result[0] == 'complete':
-                    logger.info("✓ Successfully marked task as complete")
-                    logger.info("✓ Test PASSED")
-                else:
-                    logger.error(f"✗ Task state is {state_result[0] if state_result else 'None'}, expected 'complete'")
-                    logger.error("✗ Test FAILED")
-            else:
-                logger.warning("⚠ No tasks found - skipping test")
-            
-            conn.rollback()
-            logger.info("✓ Transaction rolled back - no permanent changes")
-            
-        finally:
-            db_pool.putconn(conn)
-            
-    except Exception as e:
-        logger.error(f"Error in test_mark_tasks_complete: {e}", exc_info=True)
-    finally:
-        db_pool.closeall()
+def _build_dashboard():
+    m = _types.ModuleType("dashboard")
+    m.start_dashboard_in_thread = lambda *a, **k: None
+    return m
+
+
+# async_processing_server imports these at module load. The coordination tests
+# don't use them; stub only if they aren't importable in this environment.
+_stub_module_if_unimportable("maintain_database", _build_maintain)
+_stub_module_if_unimportable("dashboard", _build_dashboard)
+
+import async_processing_server as S
+# The class reads a module-global db_pool in __init__; it's only created in
+# __main__, so provide a placeholder for the tests.
+S.db_pool = None
+
+_LOG = logging.getLogger("test_server")
+_LOG.setLevel(logging.CRITICAL)  # keep the server's own logging quiet (don't disable globally)
+
+
+def _server(model_ids):
+    srv = S.ProcessingServer("h", 5000, _LOG, {})
+    srv.all_model_ids = list(model_ids)
+    return srv
+
+
+def test_no_double_assignment():
+    srv = _server([1, 2, 3])
+    a, b = object(), object()
+    m1 = srv.pick_model_for(a, [])
+    m2 = srv.pick_model_for(b, [])
+    ts.check("two clients get different models", m1 != m2)
+    ts.check("each model has one owner", srv.model_owner[m1] is a and srv.model_owner[m2] is b)
+
+
+def test_resume_owned_model():
+    srv = _server([1, 2, 3])
+    a = object()
+    m = srv.pick_model_for(a, [])
+    again = srv.pick_model_for(a, [99])  # still owns m, unfinished -> resume
+    ts.check("client resumes its unfinished model", again == m)
+
+
+def test_affinity_to_loaded():
+    srv = _server([1, 2, 3])
+    a, b = object(), object()
+    srv.pick_model_for(a, [])          # a takes model 1
+    srv.handle_model_complete(b, None)  # no-op guard
+    # b has model 3 loaded; 1 is owned by a, so b should get 3 (affinity), not 2
+    choice = srv.pick_model_for(b, [3])
+    ts.check("affinity picks an already-loaded model", choice == 3)
+
+
+def test_complete_and_release():
+    srv = _server([1, 2, 3])
+    a, b, c = object(), object(), object()
+    m_a = srv.pick_model_for(a, [])   # 1
+    m_b = srv.pick_model_for(b, [])   # 2
+    srv.handle_model_complete(b, m_b, scored_count=5)
+    ts.check("completed model recorded", m_b in srv.completed_models)
+    ts.check("completed model freed from owner", m_b not in srv.model_owner)
+    # c can't get anything: 1 owned by a, 3 free... actually 3 is free
+    got = srv.pick_model_for(c, [])
+    ts.check("remaining free model assigned to new client", got == 3)
+    # now everything is owned (1=a,3=c) or complete (2); next client gets nothing
+    d = object()
+    ts.check("nothing left to assign", srv.pick_model_for(d, []) is None)
+    # a disconnects -> model 1 freed
+    srv.release_client(a)
+    ts.check("released model becomes assignable", srv.pick_model_for(d, []) == m_a)
+
+
+def test_snapshot():
+    srv = _server([1, 2, 3])
+    a = object()
+    srv._client_record(a)["machine_name"] = "boxA"
+    srv.pick_model_for(a, [])
+    snap = srv.get_worker_snapshot()
+    ts.check("snapshot totals models", snap["total_models"] == 3)
+    ts.check("snapshot counts busy models", snap["busy_models"] == 1)
+    ts.check("snapshot lists the client", any(c["machine_name"] == "boxA" for c in snap["clients"]))
 
 
 def run_all_tests():
-    """Run all server function tests."""
-    logger.info("\n" + "=" * 60)
-    logger.info("SERVER FUNCTION TESTS")
-    logger.info("=" * 60)
-    
-    try:
-        test_clear_assigned_tasks()
-        test_get_pending_tasks()
-        test_mark_tasks_complete()
-        
-        logger.info("\n" + "=" * 60)
-        logger.info("All server function tests completed!")
-        logger.info("=" * 60)
-        
-    except Exception as e:
-        logger.error(f"Critical error in test suite: {e}", exc_info=True)
+    print("\n=== SERVER COORDINATION TESTS (offline) ===")
+    test_no_double_assignment()
+    test_resume_owned_model()
+    test_affinity_to_loaded()
+    test_complete_and_release()
+    test_snapshot()
+    print("All server function tests passed.")
 
 
 if __name__ == "__main__":

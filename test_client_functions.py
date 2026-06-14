@@ -1,258 +1,98 @@
 """
-Test script for client/client.py functions.
-Uses transactions with rollback to avoid permanent database changes.
+Offline unit tests for client/async_processing_client.py (model-major scoring).
+
+These do NOT require a database or network. They exercise:
+  * transcript prep / item building / scoring helpers
+  * the DB helper functions (db_get_pending_video_ids, db_get_transcript_text,
+    db_load_models, db_save_scores) against an in-memory fake pool
+matching the migrated schema (integer ids, model_id).
+
+Run directly:  python test_client_functions.py
+Or via:        python run_all_tests.py
 """
 
-import sys
 import os
-import json
-import psycopg2
-from psycopg2 import pool
-import asyncio
-import logging
+import sys
 
-# Add parent directory to path
 root_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, root_dir)
-sys.path.insert(0, os.path.join(root_dir, 'client'))
+sys.path.insert(0, os.path.join(root_dir, "client"))
 
-# Mock packet_handler before importing client
-try:
-    import test_mock_packet_handler
-except ImportError:
-    pass
+import test_support as ts
+ts.ensure_stubs()  # stub nltk/psutil/psycopg2 only if missing
 
-# Import client module
-import importlib.util
-client_path = os.path.join(root_dir, 'client', 'client.py')
-spec = importlib.util.spec_from_file_location("client_module", client_path)
-client = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(client)
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import async_processing_client as C
 
 
-def load_db_config():
-    with open('config/db_config.json', 'r') as f:
-        return json.load(f)
+def _log():
+    import logging
+    return logging.getLogger("test_client")
 
 
-def test_load_model_from_db():
-    """Test loading a model from the database."""
-    logger.info("=" * 60)
-    logger.info("Testing load_model_from_db()")
-    logger.info("=" * 60)
-    
-    db_params = load_db_config()
-    conn = psycopg2.connect(**db_params)
-    
+def test_prep_and_items():
+    transcript = C.prep_transcript("the quick brown fox jumps over", n_gram_size=4)
+    ts.check("prep_transcript left-pads with <s>", transcript[:3] == ["<s>", "<s>", "<s>"])
+    ts.check("prep_transcript keeps the words", "quick" in transcript and "fox" in transcript)
+
+    items = C.build_transcript_items(transcript, n_gram_size=4)
+    ts.check("build_transcript_items is non-empty", len(items) > 0)
+    ts.check("each item is (word, context)", all(len(it) == 2 for it in items))
+    ts.check("context length is n_gram_size-1", all(len(ctx) == 3 for _, ctx in items))
+
+
+def test_scoring():
+    model = ts.FakeModel(value=0.5)
+    transcript = C.prep_transcript("alpha beta gamma delta epsilon zeta", 4)
+    items = C.build_transcript_items(transcript, 4)
+    scores = C.score_transcript_items(model, items)
+    ts.check("scores produced for every context", len(scores) == sum(1 for _, c in items if c))
+    ts.check("scores reflect the model", all(s == 0.5 for s in scores))
+
+
+def test_db_get_pending_video_ids():
+    pool = ts.FakePool(pending_ids=[101, 102, 103])
+    ids = C.db_get_pending_video_ids(pool, model_id=7, logger=_log())
+    ts.check("returns the pending vid ids", ids == [101, 102, 103])
+    ts.check("connection returned to pool", pool.checked_out == 0)
+
+
+def test_db_get_transcript_text():
+    pool = ts.FakePool(transcript_segments=["hello there", "general kenobi"])
+    text = C.db_get_transcript_text(pool, vid_id=101, logger=_log())
+    ts.check("segments joined in order", text == "hello there general kenobi")
+
+
+def test_db_load_models():
+    pool = ts.FakePool(models={7: ts.FakeModel(0.9), 8: ts.FakeModel(0.1)})
+    loaded = C.db_load_models(pool, [7, 8], logger=_log())
+    ts.check("both models unpickled", set(loaded.keys()) == {7, 8})
+    ts.check("model usable after load", loaded[7].score("w", ["a", "b", "c"]) == 0.9)
+
+
+def test_db_save_scores():
+    pool = ts.FakePool()
+    # Capture the batched upsert instead of hitting a real cursor.
+    original = C.execute_values
+    C.execute_values = ts.make_capturing_execute_values(pool)
     try:
-        conn.autocommit = False
-        
-        cursor = conn.cursor()
-        cursor.execute("SELECT MODEL_KEY FROM MODEL_TABLE LIMIT 1")
-        result = cursor.fetchone()
-        
-        if result:
-            model_key = result[0]
-            logger.info(f"Found model key: {model_key}")
-            
-            async def test_async():
-                model = await client.load_model_from_db(conn, model_key)
-                if model:
-                    logger.info(f"✓ Successfully loaded model {model_key}")
-                    logger.info(f"  Model type: {type(model)}")
-                    logger.info(f"  Has score method: {hasattr(model, 'score')}")
-                else:
-                    logger.warning(f"✗ Failed to load model {model_key}")
-                return model
-            
-            model = asyncio.run(test_async())
-            
-            if model:
-                logger.info("✓ Test PASSED")
-            else:
-                logger.warning("✗ Test FAILED - Model not loaded")
-        else:
-            logger.warning("⚠ No models found in database - skipping model load test")
-        
-        # Test 2: Try to load a non-existent model
-        logger.info("\nTest 2: Loading non-existent model")
-        async def test_nonexistent():
-            model = await client.load_model_from_db(conn, "NON_EXISTENT_MODEL_KEY_12345")
-            if model is None:
-                logger.info("✓ Correctly returned None for non-existent model")
-                return True
-            else:
-                logger.error("✗ Should have returned None for non-existent model")
-                return False
-        
-        result = asyncio.run(test_nonexistent())
-        if result:
-            logger.info("✓ Test 2 PASSED")
-        else:
-            logger.error("✗ Test 2 FAILED")
-        
-        conn.rollback()
-        logger.info("\n✓ Transaction rolled back - no permanent changes")
-        
-    except Exception as e:
-        logger.error(f"Error in test_load_model_from_db: {e}", exc_info=True)
-        conn.rollback()
+        rows = [(101, 7, [0.1, 0.2]), (102, 7, [0.3])]
+        n = C.db_save_scores(pool, rows, logger=_log())
     finally:
-        conn.close()
-
-
-def test_get_transcript():
-    """Test getting transcript from database."""
-    logger.info("\n" + "=" * 60)
-    logger.info("Testing get_transcript()")
-    logger.info("=" * 60)
-    
-    db_params = load_db_config()
-    db_pool = pool.ThreadedConnectionPool(1, 5, **db_params)
-    
-    try:
-        conn = db_pool.getconn()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT VID_ID 
-                FROM VID_TRANSCRIPT_TABLE
-                WHERE WORD_COUNT > 0
-                LIMIT 1
-            """)
-            result = cursor.fetchone()
-            
-            if result:
-                vid_id = result[0]
-                logger.info(f"Found video ID: {vid_id}")
-                
-                transcript = client.get_transcript(db_pool, vid_id, 4)
-                
-                if transcript:
-                    logger.info(f"✓ Successfully retrieved transcript")
-                    logger.info(f"  Transcript length: {len(transcript)} tokens")
-                    logger.info(f"  First 10 tokens: {transcript[:10]}")
-                    logger.info("✓ Test PASSED")
-                else:
-                    logger.warning("✗ Test FAILED - No transcript returned")
-            else:
-                logger.warning("⚠ No videos with transcripts found - skipping transcript test")
-        finally:
-            db_pool.putconn(conn)
-        
-        # Test 2: Try to get transcript for non-existent video
-        logger.info("\nTest 2: Getting transcript for non-existent video")
-        conn = db_pool.getconn()
-        try:
-            transcript = client.get_transcript(db_pool, "NON_EXISTENT_VIDEO_ID_12345", 4)
-            if not transcript:
-                logger.info("✓ Correctly returned empty list for non-existent video")
-                logger.info("✓ Test 2 PASSED")
-            else:
-                logger.error("✗ Should have returned empty list for non-existent video")
-                logger.error("✗ Test 2 FAILED")
-        finally:
-            db_pool.putconn(conn)
-        
-    except Exception as e:
-        logger.error(f"Error in test_get_transcript: {e}", exc_info=True)
-    finally:
-        db_pool.closeall()
-
-
-def test_save_results():
-    """Test saving results to database."""
-    logger.info("\n" + "=" * 60)
-    logger.info("Testing save_results()")
-    logger.info("=" * 60)
-    
-    db_params = load_db_config()
-    db_pool = pool.ThreadedConnectionPool(1, 5, **db_params)
-    
-    try:
-        conn = db_pool.getconn()
-        conn.autocommit = False
-        
-        try:
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT VID_ID, MODEL_KEY
-                FROM VID_TABLE v, MODEL_TABLE m
-                LIMIT 1
-            """)
-            result = cursor.fetchone()
-            
-            if not result:
-                logger.warning("⚠ No videos or models found - skipping save_results test")
-                return
-            
-            test_vid_id = result[0]
-            test_model_key = result[1]
-            
-            logger.info(f"Test: Saving results for video {test_vid_id}, model {test_model_key}")
-            
-            test_results = [{
-                'model_key': test_model_key,
-                'score': [0.1, 0.2, 0.3, 0.4, 0.5],
-                'time_taken': 1.23
-            }]
-            
-            client.save_results(db_pool, test_vid_id, test_results)
-            
-            cursor.execute("""
-                SELECT SCORE, INSERT_AT
-                FROM VID_SCORE_TABLE
-                WHERE VID_ID = %s AND MODEL_KEY = %s
-            """, (test_vid_id, test_model_key))
-            
-            saved_result = cursor.fetchone()
-            
-            if saved_result:
-                logger.info(f"✓ Successfully saved results")
-                logger.info(f"  Score array length: {len(saved_result[0])}")
-                logger.info(f"  Insert timestamp: {saved_result[1]}")
-                logger.info("✓ Test PASSED")
-            else:
-                logger.error("✗ Results were not saved correctly")
-                logger.error("✗ Test FAILED")
-            
-            conn.rollback()
-            logger.info("✓ Transaction rolled back - no permanent changes")
-            
-        finally:
-            db_pool.putconn(conn)
-            
-    except Exception as e:
-        logger.error(f"Error in test_save_results: {e}", exc_info=True)
-        try:
-            conn.rollback()
-        except:
-            pass
-    finally:
-        db_pool.closeall()
+        C.execute_values = original
+    ts.check("save returns row count", n == 2)
+    ts.check("rows captured with (vid_id, model_id, score)", pool.saved == rows)
+    ts.check("commit issued", pool.store["commits"] == 1)
 
 
 def run_all_tests():
-    """Run all client function tests."""
-    logger.info("\n" + "=" * 60)
-    logger.info("CLIENT FUNCTION TESTS")
-    logger.info("=" * 60)
-    
-    try:
-        test_load_model_from_db()
-        test_get_transcript()
-        test_save_results()
-        
-        logger.info("\n" + "=" * 60)
-        logger.info("All client function tests completed!")
-        logger.info("=" * 60)
-        
-    except Exception as e:
-        logger.error(f"Critical error in test suite: {e}", exc_info=True)
+    print("\n=== CLIENT FUNCTION TESTS (offline) ===")
+    test_prep_and_items()
+    test_scoring()
+    test_db_get_pending_video_ids()
+    test_db_get_transcript_text()
+    test_db_load_models()
+    test_db_save_scores()
+    print("All client function tests passed.")
 
 
 if __name__ == "__main__":

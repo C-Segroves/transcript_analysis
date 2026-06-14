@@ -1,3 +1,28 @@
+"""
+async_processing_client.py  (model-major worker)
+
+A scoring client that works one MODEL at a time:
+
+  1. Ask the server for a model to work on, reporting which models we already
+     have loaded so the server can prefer one of those (affinity) and never hand
+     the same model to two clients at once.
+  2. Load that model (from model_table) if it isn't already cached. The cache is
+     a small RAM-aware LRU, so big-RAM machines keep several models hot and
+     small ones evict the least-recently-used to stay under budget.
+  3. Find every video whose transcript still lacks a score for this model and
+     score them, saving results in batches. ("Pending" is always derived from
+     missing scores, so the work is resumable after a restart.)
+  4. Tell the server the model is complete and ask for the next one.
+
+Use one client process per core you want to use: each process owns a different
+model (the server enforces that), so N processes on a box use N cores without
+any of them duplicating work.
+
+Schema: this targets the migrated DB (integer ids) --
+  vid_table(id, yt_vid_id), vid_transcript_table(vid_id -> vid_table.id, word_count, ...),
+  model_table(id, external_key, model_data), vid_score_table(vid_id, model_id, score).
+"""
+
 import asyncio
 import json
 import os
@@ -5,89 +30,88 @@ import platform
 import logging
 import pickle
 import time
-import socket
-import multiprocessing as mp
-from psycopg2 import pool
-import psycopg2
-import sys
 import signal
-
-import platform
-
-import task_processor as tp
-
-from aiomultiprocess import Pool
-
-def check_platform_and_import_wmi():
-    print(platform.system())
-    if platform.system() == "Windows":
-        try:
-            import wmi
-            print("WMI library loaded successfully.")
-        except ImportError as e:
-            print(f"Failed to import WMI: {e}")
-    else:
-        print("WMI is not required on non-Windows platforms.")
-
-
+from collections import OrderedDict
 
 import psutil
+import psycopg2
+from psycopg2 import pool
+from psycopg2.extras import execute_values
 
-from nltk.util import ngrams, pad_sequence, everygrams
 from nltk.tokenize import word_tokenize
+from nltk.util import pad_sequence
 
 from async_client import BaseClient
 
-model_dict = {}
-current_task = None
+# ---------------------------------------------------------------------------
+# Config / logging
+# ---------------------------------------------------------------------------
+
+N_GRAM_SIZE = int(os.getenv("N_GRAM_SIZE", "4"))
+# Max models to keep cached in this process (LRU). 1 is fine for model-major;
+# a couple gives reuse across maintenance re-pending. Tune to the box's RAM.
+MODEL_CACHE_SIZE = int(os.getenv("MODEL_CACHE_SIZE", "3"))
+# Evict LRU models when system memory usage exceeds this percent.
+MEMORY_HIGH_PERCENT = float(os.getenv("MEMORY_HIGH_PERCENT", "85"))
+# How many videos to score before flushing scores to the DB.
+SAVE_BATCH = int(os.getenv("SAVE_BATCH", "10"))
+# Seconds to wait when the server has no work for us.
+NO_WORK_POLL_SECONDS = int(os.getenv("NO_WORK_POLL_SECONDS", "15"))
+
 
 def load_config():
     try:
         with open('config/db_config.json', 'r') as f:
             return json.load(f)
     except FileNotFoundError as e:
-        logger.error(f"Database config file not found: {e}")
+        logging.getLogger('ProcessingClient').error(f"Database config file not found: {e}")
         raise
     except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in db_config.json: {e}")
+        logging.getLogger('ProcessingClient').error(f"Invalid JSON in db_config.json: {e}")
         raise
+
 
 DB_CONFIG = load_config()
 
+
 def setup_logger(log_file_path):
     logger = logging.getLogger('ProcessingClient')
-    logger.setLevel(logging.INFO)#logging.DEBUG#logging.INFO
+    logger.setLevel(logging.INFO)
     ch = logging.StreamHandler()
     ch.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    ch.setFormatter(formatter)
+    ch.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(ch)
     return logger
 
+
+# ---------------------------------------------------------------------------
+# CPU temperature helpers (kept from the original client, used in health packet)
+# ---------------------------------------------------------------------------
+
 def get_cpu_temp_linux():
     try:
-        # psutil.sensors_temperatures() returns a dictionary of temperature sensors
         temps = psutil.sensors_temperatures()
-        if "coretemp" in temps:  # 'coretemp' is common for CPU temperature
+        if "coretemp" in temps:
             for entry in temps["coretemp"]:
-                if entry.label == "Package id 0":  # CPU package temperature
+                if entry.label == "Package id 0":
                     return entry.current
-        elif "cpu-thermal" in temps:  # Some systems use 'cpu-thermal'
+        elif "cpu-thermal" in temps:
             return temps["cpu-thermal"][0].current
-        else:
-            return "CPU temperature sensor not found."
+        return "CPU temperature sensor not found."
     except Exception as e:
         return f"Error reading CPU temperature: {e}"
 
+
 def get_cpu_temp_windows_wmi():
     try:
-        w = wmi.WMI(namespace="root\OpenHardwareMonitor")
-        temperature_info = w.Sensor()
-        for sensor in temperature_info:
+        import wmi
+        w = wmi.WMI(namespace="root\\OpenHardwareMonitor")
+        for sensor in w.Sensor():
             if sensor.SensorType == "Temperature":
-                return sensor.Value  # Return the first temperature value
+                return sensor.Value
     except Exception as e:
         return f"Error reading CPU temperature: {e}"
+
 
 def get_cpu_temp():
     system = platform.system()
@@ -95,415 +119,325 @@ def get_cpu_temp():
         return get_cpu_temp_linux()
     elif system == "Windows":
         return get_cpu_temp_windows_wmi()
-    else:
-        return "Unsupported OS"
+    return "Unsupported OS"
+
+
+# ---------------------------------------------------------------------------
+# Packet builders
+# ---------------------------------------------------------------------------
 
 def generate_client_init_packet(machine_name):
     return {"packet_type": "init_packet", "additional_data": {"machine_name": machine_name}}
 
-def generate_task_request_packet():
-    return {'packet_type': 'task_request', 'additional_data': {}}
 
-def get_pending_tasks(logger, batch_size=100, n_gram_size=4, conn=None):
-    """Get pending tasks by finding videos with transcripts that don't have scores for some models."""
-    try:
-        logger.info('Attempting to get pending tasks from database.')
-        cursor = conn.cursor()
-        # Find a video that has transcripts but is missing scores for some models
-        get_vid_id_query = """
-            SELECT DISTINCT v.vid_id
-            FROM vid_table v
-            INNER JOIN vid_transcript_table vt ON v.vid_id = vt.vid_id
-            WHERE vt.word_count > 0
-            AND EXISTS (
-                SELECT 1 FROM model_table m
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM vid_score_table vs
-                    WHERE vs.vid_id = v.vid_id AND vs.model_key = m.model_key
-                )
-            )
-            LIMIT 1
-        """
-        cursor.execute(get_vid_id_query)
-        result = cursor.fetchone()
-        if not result:
-            logger.info('No pending tasks found in database.')
-            return None
-        vid_id = result[0]
+def generate_work_request_packet(machine_name, loaded_models):
+    return {"packet_type": "work_request",
+            "additional_data": {"machine_name": machine_name, "loaded_models": list(loaded_models)}}
 
-        logger.info(f'VID_ID {vid_id} has been selected for processing.')
-        
-        # Get model keys that don't have scores for this video yet
-        get_model_keys_query = """
-            SELECT m.model_key
-            FROM model_table m
-            WHERE NOT EXISTS (
-                SELECT 1 FROM vid_score_table vs
-                WHERE vs.vid_id = %s AND vs.model_key = m.model_key
-            )
-            LIMIT %s
-        """
-        cursor.execute(get_model_keys_query, (vid_id, batch_size))
-        model_keys = [row[0] for row in cursor.fetchall()]
-        num_model_keys = len(model_keys)
-        model_keys = model_keys[0:min(batch_size, num_model_keys)]
 
-        pending_task = {
-            'packet_type': 'task_packet',
-            'additional_data': {
-                'vid_id': vid_id,
-                'model_keys': model_keys,
-                'n_gram_size': n_gram_size
-            }
-        }
-        logger.info(f'Pending task created:')
-        return pending_task
-    except psycopg2.Error as e:
-        logger.error(f"Database error fetching pending tasks: {e}")
-        if "current transaction is aborted" in str(e).lower():
-            logger.critical("Transaction aborted detected. Aborting client.")
-            conn.rollback()
-            sys.exit(1)
-        conn.rollback()
-        return None
-    finally:
-        cursor.close()
+def generate_model_complete_packet(model_id, scored_count):
+    return {"packet_type": "model_complete",
+            "additional_data": {"model_id": model_id, "scored_count": scored_count}}
 
-def get_transcript(vid_id, n_gram_size, conn=None):
-    try:
-        cursor = conn.cursor()
-        query = """
-            SELECT text 
-            FROM vid_transcript_table 
-            WHERE vid_id = %s AND word_count > 0 
-            ORDER BY cum_word_count
-        """
-        cursor.execute(query, (vid_id,))
-        transcript_bits = [str(row[0]) for row in cursor.fetchall()]
-        transcript = ' '.join(transcript_bits)
-        output = prep_transcript(transcript, n_gram_size)
-        return output
-    except psycopg2.Error as e:
-        logger.error(f"Database error fetching transcript for VID_ID {vid_id}: {e}")
-        if "current transaction is aborted" in str(e).lower():
-            logger.critical("Transaction aborted detected. Aborting client.")
-            conn.rollback()
-            sys.exit(1)
-        conn.rollback()
-        return []
-    finally:
-        cursor.close()
+
+def generate_health_packet(machine_name, model_cache):
+    cpu_temp = get_cpu_temp()
+    cpu_usage = psutil.cpu_percent(interval=1)
+    memory_usage = psutil.virtual_memory().percent
+    return {"packet_type": "health_packet",
+            "additional_data": {"machine_name": machine_name, "cpu_temp": cpu_temp,
+                                "cpu_usage": cpu_usage, "memory_usage": memory_usage,
+                                "loaded_models": list(model_cache.keys())}}
+
+
+# ---------------------------------------------------------------------------
+# Transcript prep + scoring (pure, runs off the event loop via to_thread)
+# ---------------------------------------------------------------------------
 
 def prep_transcript(transcript, n_gram_size):
-    try:
-        return list(pad_sequence(word_tokenize(transcript), n_gram_size, pad_left=True, left_pad_symbol="<s>"))
-    except Exception as e:
-        logger.error(f"Error preparing transcript: {e}")
-        return []
+    return list(pad_sequence(word_tokenize(transcript), n_gram_size,
+                             pad_left=True, left_pad_symbol="<s>"))
 
 
-from aiomultiprocess import Pool
+def build_transcript_items(transcript, n_gram_size):
+    """Each item is (word, preceding (n_gram_size-1) context words)."""
+    return [
+        (item, transcript[j:j + n_gram_size - 1])
+        for j, item in enumerate(transcript[n_gram_size - 1:])
+        if j + n_gram_size - 1 < len(transcript)
+    ]
 
-async def handle_task_packet(db_pool, packet, logger, times):
-    log_pool_stats(db_pool, logger)
-    results = []
+
+def score_transcript_items(model, transcript_items):
+    score = model.score  # local bind for the hot loop
+    return [score(item, ngram) for item, ngram in transcript_items if ngram]
+
+
+# ---------------------------------------------------------------------------
+# DB access (all called via asyncio.to_thread so the event loop stays responsive)
+# ---------------------------------------------------------------------------
+
+def db_get_pending_video_ids(db_pool, model_id, logger):
+    """Internal vid_table.id of every video whose transcript lacks a score for model_id."""
     conn = db_pool.getconn()
-
     try:
-        # Fetch pending tasks if no packet is provided
-        get_packet_start = time.time()
-        if packet is None:
-            packet = get_pending_tasks(logger, n_gram_size=4, conn=conn, batch_size=100)
-        get_packet_time = time.time() - get_packet_start
-        times['get_packet_time'] = get_packet_time
-
-        vid_id = packet.get('additional_data').get('vid_id')
-        model_keys = packet.get('additional_data').get('model_keys')
-        n_gram_size = packet.get('additional_data').get('n_gram_size')
-        logger.debug(f"Acquired connection for VID_ID {vid_id}: {id(conn)}")
-
-        # Get transcript and prepare transcript items
-        get_transcript_start = time.time()
-        transcript = get_transcript(vid_id, n_gram_size, conn)
-        get_transcript_time = time.time() - get_transcript_start
-        times['get_transcript_time'] = get_transcript_time
-
-        transcript_items = [
-            (item, transcript[j:j + n_gram_size - 1])
-            for j, item in enumerate(transcript[n_gram_size - 1:])
-            if j + n_gram_size - 1 < len(transcript)
-        ]
-
-        if not transcript_items:
-            logger.info(f"No transcript found for VID_ID {vid_id}. Assigning empty scores.")
-            results = [{'model_key': model_key, 'score': [], 'time_taken': 0} for model_key in model_keys]
-        else:
-            # Load missing models outside of process_task
-            missing_models = [key for key in model_keys if key not in model_dict]
-            if missing_models:
-                logger.info(f"Loading missing models: {missing_models}")
-                loaded_models = load_model_from_db(conn, missing_models, logger)
-                model_dict.update(loaded_models)
-
-            get_parallel_start = time.time()
-            # Use aiomultiprocess to process tasks in parallel
-            async with Pool() as pool:
-                tasks = [
-                    #process_task(transcript_items, model_key,model, vid_id, n_gram_size, logger)
-                    pool.apply(
-                        tp.process_task,
-                        args=(transcript_items, model_key, model_dict[model_key], vid_id, n_gram_size, logger)
-                    )
-                    for model_key in model_keys
-                ]
-                results = await asyncio.gather(*tasks)
-            get_parallel_time = time.time() - get_parallel_start
-            times['get_parallel_time'] = get_parallel_time
-
-        # Save results to the database
-        get_save_results_start = time.time()
-        save_results(vid_id, results, conn)
-        get_save_results_time = time.time() - get_save_results_start
-        times['save_results_time'] = get_save_results_time
-
-        get_mark_tasks_complete_start = time.time()
-        mark_tasks_complete(vid_id, results, logger, conn)
-        get_mark_tasks_complete_time= time.time() - get_mark_tasks_complete_start
-        times['mark_tasks_complete_time'] = get_mark_tasks_complete_time
-
-    except Exception as e:
-        logger.error(f"Error processing task for VID_ID {vid_id}: {e}")
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT v.id
+                FROM vid_table v
+                JOIN vid_transcript_table vt ON vt.vid_id = v.id
+                WHERE vt.word_count > 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM vid_score_table vs
+                      WHERE vs.vid_id = v.id AND vs.model_id = %s
+                  )
+                GROUP BY v.id
+                ORDER BY v.id
+            """, (model_id,))
+            return [r[0] for r in cur.fetchall()]
+    except psycopg2.Error as e:
+        logger.error(f"Error fetching pending videos for model {model_id}: {e}")
         conn.rollback()
+        return []
     finally:
-        logger.debug(f"Returning connection for VID_ID {vid_id}: {id(conn)}")
         db_pool.putconn(conn)
 
-    results_packet = generate_results_packet(vid_id, results)
-    total_task_time = time.time() - times['start']
-    times['total_task_time'] = total_task_time
-    logger.info(f"Task processing times: {times}")
 
-    return results_packet
-
-def mark_tasks_complete(vid_id, results, logger, conn=None):
-    """No-op function - state column removed. Completion is tracked by presence of scores in vid_score_table."""
-    # Tasks are considered complete when scores are saved to vid_score_table
-    # This function is kept for API compatibility but does nothing
-    num_models = len(results)
-    logger.info(f"Task completed for VID_ID: {vid_id} for {num_models} models (scores saved to vid_score_table).")
-    pass
-
-def generate_results_packet(vid_id, results):
-    return {
-        'packet_type': 'results',
-        'vid_id': vid_id,
-        'results': [{'model_key': r['model_key']} for r in results]
-    }
-
-def process_task(transcript_items, model_key, vid_id, n_gram_size, logger):
+def db_get_transcript_text(db_pool, vid_id, logger):
+    conn = db_pool.getconn()
     try:
-        start_time = time.time()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT text FROM vid_transcript_table
+                WHERE vid_id = %s AND word_count > 0
+                ORDER BY cum_word_count
+            """, (vid_id,))
+            return ' '.join(str(r[0]) for r in cur.fetchall())
+    except psycopg2.Error as e:
+        logger.error(f"Error fetching transcript for vid {vid_id}: {e}")
+        conn.rollback()
+        return ""
+    finally:
+        db_pool.putconn(conn)
 
-        # Ensure the model is loaded
-        model = model_dict.get(model_key)
-        if not model:
-            raise ValueError(f"Model {model_key} not found in model_dict.")
 
-        # Process transcript items and calculate scores
-        score = [model.score(item, ngram) for item, ngram in transcript_items if ngram]
-        time_taken = time.time() - start_time
-
-        return {'model_key': model_key, 'score': score, 'time_taken': time_taken}
-    except Exception as e:
-        logger.error(f"Processing error for VID_ID {vid_id}, MODEL_KEY {model_key}: {e}")
-        return {'model_key': model_key, 'score': [], 'time_taken': 0}
-
-def load_model_from_db(conn, model_keys, logger):
-    loaded_models = {}
-    if not model_keys:
-        logger.warning("No model keys provided to load.")
-        return loaded_models
-    
+def db_load_models(db_pool, model_ids, logger):
+    """Return {model_id: model_object} for the given ids, unpickled from model_table."""
+    loaded = {}
+    if not model_ids:
+        return loaded
+    conn = db_pool.getconn()
     try:
-        cursor = conn.cursor()
-        query = """
-            SELECT model_key, model_data 
-            FROM model_table 
-            WHERE model_key IN %s
-        """
-        cursor.execute(query, (tuple(model_keys),))
-        results = cursor.fetchall()
-        
-        if not results:
-            logger.error(f"No models found for keys: {model_keys}")
-            return loaded_models
-        
-        for model_key, model_data in results:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, external_key, model_data FROM model_table WHERE id = ANY(%s)",
+                (list(model_ids),),
+            )
+            rows = cur.fetchall()
+        for model_id, external_key, model_data in rows:
             try:
                 if isinstance(model_data, memoryview):
                     model_data = model_data.tobytes()
-                    logger.debug(f"Converted memoryview to bytes for {model_key}")
-                elif not isinstance(model_data, bytes):
-                    logger.error(f"Model data for {model_key} is not bytes or memoryview: {type(model_data)}")
-                    continue
-                
                 if not model_data:
-                    logger.error(f"Model data for {model_key} is empty")
+                    logger.error(f"Model {model_id} ({external_key}) has empty data.")
                     continue
-                
-                model = pickle.loads(model_data)
-                if model is None:
-                    logger.error(f"Deserialized model for {model_key} is None")
-                    continue
-                
-                loaded_models[model_key] = model
-                logger.debug(f"Successfully loaded NLTK model {model_key} from database. Type: {type(model)}")
-            
-            except pickle.PickleError as e:
-                logger.error(f"Pickle deserialization error for model {model_key}: {e}")
-                continue
+                loaded[model_id] = pickle.loads(model_data)
             except Exception as e:
-                logger.error(f"Unexpected error processing model {model_key}: {e}")
-                continue
-        
-        missing_keys = set(model_keys) - set(loaded_models.keys())
-        if missing_keys:
-            logger.warning(f"Failed to load models for keys: {missing_keys}")
-        
-        return loaded_models
-    
+                logger.error(f"Failed to unpickle model {model_id} ({external_key}): {e}")
+        return loaded
     except psycopg2.Error as e:
-        logger.error(f"Database error fetching models {model_keys}: {e}")
+        logger.error(f"DB error loading models {list(model_ids)}: {e}")
         conn.rollback()
-        return loaded_models
+        return loaded
     finally:
-        cursor.close()
+        db_pool.putconn(conn)
 
-def save_results(vid_id, results, conn=None):
+
+def db_save_scores(db_pool, rows, logger):
+    """rows: list of (vid_id, model_id, score_list). One batched upsert."""
+    if not rows:
+        return 0
+    conn = db_pool.getconn()
     try:
-        cursor = conn.cursor()
-        score_query = """
-            INSERT INTO vid_score_table (vid_id, model_key, score, insert_at) 
-            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (vid_id, model_key) 
-            DO UPDATE SET score = EXCLUDED.score, insert_at = CURRENT_TIMESTAMP
-        """
-        for result in results:
-            cursor.execute(score_query, (vid_id, result['model_key'], result['score']))
+        with conn.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO vid_score_table (vid_id, model_id, score, insert_at)
+                VALUES %s
+                ON CONFLICT (vid_id, model_id)
+                DO UPDATE SET score = EXCLUDED.score, insert_at = CURRENT_TIMESTAMP
+            """, [(vid_id, model_id, score, ) for (vid_id, model_id, score) in rows],
+                template="(%s, %s, %s, CURRENT_TIMESTAMP)")
         conn.commit()
+        return len(rows)
     except psycopg2.Error as e:
-        logger.error(f"Database error saving results for VID_ID {vid_id}: {e}")
-        if "current transaction is aborted" in str(e).lower():
-            logger.critical("Transaction aborted detected. Aborting client.")
-            conn.rollback()
-            sys.exit(1)
-        logger.info("Rolling back transaction in save_results")
+        logger.error(f"DB error saving {len(rows)} score row(s): {e}")
         conn.rollback()
+        return 0
     finally:
-        cursor.close()
+        db_pool.putconn(conn)
 
-def generate_shutdown_packet(machine_name, reason):
-    return {'packet_type': 'client_shutdown', 'additional_data': {'machine_name': machine_name, 'reason': reason}}
 
-def log_pool_stats(db_pool, logger):
-    logger.info(f"Connection pool stats - min: {db_pool.minconn}, max: {db_pool.maxconn}, "
-                f"open: {len(db_pool._used)}, free: {len(db_pool._pool)}")
-
-def generate_health_packet(machine_name):
-    cpu_temp=get_cpu_temp()
-    cpu_usage = psutil.cpu_percent(interval=1)
-    memory_info = psutil.virtual_memory()
-    memory_usage = memory_info.percent
-    #todo if memory is above 50% dump some models
-    if memory_usage > 50:
-        logger.warning(f"Memory usage is high: {memory_usage}%")
-        model_dict.clear()  # Clear the model cache if memory usage is high
-
-    return {'packet_type': 'health_packet', 'additional_data': {'machine_name': machine_name,'cpu_temp': cpu_temp, 'cpu_usage': cpu_usage, 'memory_usage': memory_usage}}
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
 
 class ProcessingClient(BaseClient):
-    def __init__(self, host,machine_name, port, logger, config):
+    def __init__(self, host, machine_name, port, logger, config, db_pool):
         super().__init__(host, port, logger, config)
         self.db_pool = db_pool
-        self.client_state = 'pause'
-        self.task_task = None  # Track the task processing coroutine
         self.machine_name = machine_name
-        logger.info(f"Client initialized with machine name: {self.machine_name}")
+        self.client_state = 'pause'
+        self.task_task = None
+        self.model_cache = OrderedDict()  # model_id -> model object (LRU; most-recent at end)
+        self.total_scored = 0
+        # Server replies (assignment / no_work) are delivered to the worker loop here.
+        self.assignment_queue = asyncio.Queue()
+        logger.info(f"Model-major client initialized: {machine_name} "
+                    f"(cache={MODEL_CACHE_SIZE}, n_gram={N_GRAM_SIZE})")
 
-    async def handle_error(self):
-        self.logger.info('Attempting to reconnect...')
-        await self.reconnect()
+    # ----- model cache (RAM-aware LRU) -----
+
+    def _evict_if_needed(self):
+        while len(self.model_cache) > MODEL_CACHE_SIZE:
+            old_id, _ = self.model_cache.popitem(last=False)
+            self.logger.info(f"Evicted model {old_id} (cache over size {MODEL_CACHE_SIZE}).")
+        # Pressure-based eviction: drop LRU models while memory is high (keep >=1).
+        try:
+            while len(self.model_cache) > 1 and psutil.virtual_memory().percent > MEMORY_HIGH_PERCENT:
+                old_id, _ = self.model_cache.popitem(last=False)
+                self.logger.warning(f"Memory high; evicted model {old_id}.")
+        except Exception:
+            pass
+
+    async def ensure_model(self, model_id):
+        """Return the model object for model_id, loading + caching it if needed."""
+        if model_id in self.model_cache:
+            self.model_cache.move_to_end(model_id)  # mark most-recently-used
+            return self.model_cache[model_id]
+        self.logger.info(f"Loading model {model_id} from DB...")
+        loaded = await asyncio.to_thread(db_load_models, self.db_pool, [model_id], self.logger)
+        model = loaded.get(model_id)
+        if model is None:
+            return None
+        self.model_cache[model_id] = model
+        self.model_cache.move_to_end(model_id)
+        self._evict_if_needed()
+        return model
+
+    # ----- packet handling -----
 
     async def process_received_data(self, packet):
-        packet_type = packet['packet_type']
-        self.logger.info(f'Processing packet of type: {packet_type} (current state: {self.client_state})')
+        packet_type = packet.get('packet_type')
+        self.logger.info(f"Received packet: {packet_type} (state: {self.client_state})")
         try:
             match packet_type:
                 case 'play':
-                    self.logger.info('Received play packet. Resuming client.')
                     self.client_state = 'play'
                     if not self.task_task or self.task_task.done():
-                        self.task_task = asyncio.create_task(self.process_tasks())
+                        self.task_task = asyncio.create_task(self.worker_loop())
                 case 'pause':
-                    self.logger.info('Received pause packet. Pausing client.')
                     self.client_state = 'pause'
-                    if self.task_task and not self.task_task.done():
-                        self.task_task.cancel()
-                        try:
-                            await self.task_task
-                        except asyncio.CancelledError:
-                            self.logger.info("Task processing cancelled due to pause")
+                    # The worker loop checks client_state between videos and stops.
+                case 'assignment' | 'no_work':
+                    await self.assignment_queue.put(packet)
                 case 'health_check':
-                    health_packet=generate_health_packet(self.machine_name)
-                    await self.send_data(health_packet)
+                    await self.send_data(generate_health_packet(self.machine_name, self.model_cache))
                 case 'shutdown_request':
                     await self.graceful_shutdown()
                 case _:
-                    self.logger.error(f'Client: Received unknown packet type: {packet_type}')
+                    self.logger.error(f"Unknown packet type: {packet_type}")
         except Exception as e:
-            self.logger.error(f'Error while processing packet: {e}')
-            await self.handle_error()
+            self.logger.error(f"Error processing packet {packet_type}: {e}")
 
     async def initialize_client(self):
         self.config = load_config()
-        #self.machine_name = socket.gethostname()
-        self.task_time_tracker_last_time = time.time()
-        
-        init_packet = generate_client_init_packet(self.machine_name)
-        self.logger.info(f'Initializing client with machine name: {self.machine_name} : {init_packet}')
-        await self.send_data(init_packet)
+        await self.send_data(generate_client_init_packet(self.machine_name))
+        self.logger.info(f"Sent init packet for {self.machine_name}")
 
-    async def process_tasks(self):
+    # ----- the model-major worker loop -----
+
+    async def request_model(self):
+        """Ask the server for a model; return model_id or None (no work)."""
+        # Drain any stale replies first.
+        while not self.assignment_queue.empty():
+            self.assignment_queue.get_nowait()
+        await self.send_data(generate_work_request_packet(self.machine_name, self.model_cache.keys()))
+        reply = await self.assignment_queue.get()
+        if reply.get('packet_type') == 'assignment':
+            return reply.get('additional_data', {}).get('model_id')
+        return None
+
+    async def process_model(self, model_id):
+        """Score every pending video for model_id. Returns count scored."""
+        model = await self.ensure_model(model_id)
+        if model is None:
+            self.logger.error(f"Could not load model {model_id}; reporting complete to avoid stalling.")
+            return 0
+
+        pending = await asyncio.to_thread(db_get_pending_video_ids, self.db_pool, model_id, self.logger)
+        self.logger.info(f"Model {model_id}: {len(pending)} pending video(s).")
+
+        scored = 0
+        batch = []
+        for vid_id in pending:
+            if self.client_state != 'play':
+                self.logger.info("Paused mid-model; flushing and stopping.")
+                break
+            text = await asyncio.to_thread(db_get_transcript_text, self.db_pool, vid_id, self.logger)
+            if not text:
+                continue
+            transcript = await asyncio.to_thread(prep_transcript, text, N_GRAM_SIZE)
+            items = build_transcript_items(transcript, N_GRAM_SIZE)
+            if not items:
+                # No usable items: store empty score so it isn't retried forever.
+                batch.append((vid_id, model_id, []))
+            else:
+                score = await asyncio.to_thread(score_transcript_items, model, items)
+                batch.append((vid_id, model_id, score))
+            if len(batch) >= SAVE_BATCH:
+                saved = await asyncio.to_thread(db_save_scores, self.db_pool, batch, self.logger)
+                scored += saved
+                self.total_scored += saved
+                batch = []
+            await asyncio.sleep(0)  # yield to the event loop (health/pause stay responsive)
+
+        if batch:
+            saved = await asyncio.to_thread(db_save_scores, self.db_pool, batch, self.logger)
+            scored += saved
+            self.total_scored += saved
+        return scored
+
+    async def worker_loop(self):
+        self.logger.info("Worker loop started.")
         while self.client_state == 'play':
-            times = {}
-            times['start'] = time.time()
-            
-            # Await the asynchronous handle_task_packet function
-            results_packet = await handle_task_packet(self.db_pool, current_task, self.logger, times)
-            
-            self.logger.info(f'Processing complete. Got results packet with {len(results_packet["results"])} results.')
-            
-            # Yield to allow other tasks to run
-            await asyncio.sleep(0.1)
-        
-        self.logger.info('Client paused or stopped. Exiting task processing.')
+            model_id = await self.request_model()
+            if model_id is None:
+                self.logger.info(f"No work available; retrying in {NO_WORK_POLL_SECONDS}s.")
+                await asyncio.sleep(NO_WORK_POLL_SECONDS)
+                continue
+            scored = await self.process_model(model_id)
+            if self.client_state != 'play':
+                # Paused before finishing: keep the model (server still owns it for us);
+                # we'll resume it on the next play.
+                break
+            await self.send_data(generate_model_complete_packet(model_id, scored))
+            self.logger.info(f"Model {model_id} done (+{scored}, total {self.total_scored}).")
+            await asyncio.sleep(0.05)
+        self.logger.info("Worker loop exiting (paused/stopped).")
+
+    # ----- lifecycle -----
 
     async def reconnect(self):
-        max_retries = 5
-        retry_delay = 5
-        for attempt in range(max_retries):
+        for attempt in range(5):
             try:
                 await self.connect()
-                self.logger.info('Reconnected successfully.')
                 await self.initialize_client()
+                self.logger.info("Reconnected.")
                 return
             except Exception as e:
-                self.logger.error(f'Reconnection attempt {attempt + 1} failed: {e}')
-                if attempt < max_retries - 1:
-                    self.logger.info(f'Retrying in {retry_delay} seconds...')
-                    await asyncio.sleep(retry_delay)
-                else:
-                    self.logger.error('Max retries reached. Unable to reconnect.')
+                self.logger.error(f"Reconnect attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep(5)
+        self.logger.error("Max reconnect retries reached.")
 
     async def run(self):
         try:
@@ -516,38 +450,38 @@ class ProcessingClient(BaseClient):
         except Exception as e:
             self.logger.error(f"An error occurred: {e}")
         finally:
-            if hasattr(self, 'writer') and self.writer:
+            if getattr(self, 'writer', None):
                 self.writer.close()
                 await self.writer.wait_closed()
 
     async def graceful_shutdown(self):
-        self.logger.info('Received shutdown request. Initiating graceful shutdown.')
+        self.logger.info("Graceful shutdown requested.")
+        self.client_state = 'shutdown'
         if self.task_task and not self.task_task.done():
             self.task_task.cancel()
             try:
                 await self.task_task
             except asyncio.CancelledError:
-                self.logger.info("Task processing cancelled during shutdown")
-        shutdown_packet = generate_shutdown_packet(self.machine_name, 'Received shutdown request')
-        await self.send_data(shutdown_packet)
-        self.client_state = 'shutdown'
+                pass
+
 
 if __name__ == "__main__":
-    check_platform_and_import_wmi()
     config = load_config()
     logger = setup_logger('')
 
     db_pool = pool.ThreadedConnectionPool(1, 20, **DB_CONFIG)
     server_host = os.environ.get('SERVER_HOST', 'localhost')
-    machine_name = os.environ.get('MACHINE_NAME', 'localhost')
-    logger.info(f"Server host: {server_host}")
+    machine_name = os.environ.get('MACHINE_NAME', platform.node() or 'client')
+    logger.info(f"Server host: {server_host}, machine: {machine_name}")
 
-    client = ProcessingClient(server_host, machine_name, 5000, logger, config)
+    client = ProcessingClient(server_host, machine_name, 5000, logger, config, db_pool)
 
-    # Signal handling for graceful shutdown
     def handle_signal(signal_number, frame):
-        logger.warning(f"Received signal {signal_number}. Initiating shutdown.")
-        asyncio.run(client.graceful_shutdown())
+        logger.warning(f"Received signal {signal_number}. Shutting down.")
+        try:
+            asyncio.run(client.graceful_shutdown())
+        except Exception:
+            pass
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)

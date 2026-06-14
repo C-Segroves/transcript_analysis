@@ -1,314 +1,162 @@
 """
-Test script for client/async_processing_client.py functions.
-Uses transactions with rollback to avoid permanent database changes.
+Offline unit tests for the async, model-major flow of the scoring client
+(client/async_processing_client.py): the ProcessingClient request/score/report
+loop and its RAM-aware LRU model cache.
+
+No database or network required. asyncio.to_thread is replaced with an inline
+shim so the tests don't depend on a thread pool, and the "server" is simulated
+by replying to each work_request the client sends.
+
+Run directly:  python test_async_client_functions.py
+Or via:        python run_all_tests.py
 """
 
-import sys
 import os
-import json
-import psycopg2
-from psycopg2 import pool
+import sys
+import asyncio
 import logging
 
-# Add parent directory to path
+os.environ.setdefault("NO_WORK_POLL_SECONDS", "0")  # don't really sleep on no_work
+os.environ.setdefault("MODEL_CACHE_SIZE", "2")      # small cache so we can test eviction
+
 root_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, root_dir)
-sys.path.insert(0, os.path.join(root_dir, 'client'))
+sys.path.insert(0, os.path.join(root_dir, "client"))
 
-# Import async_processing_client module
-import importlib.util
-async_client_path = os.path.join(root_dir, 'client', 'async_processing_client.py')
-spec = importlib.util.spec_from_file_location("async_processing_client", async_client_path)
-async_processing_client = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(async_processing_client)
+import test_support as ts
+ts.ensure_stubs()
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import async_processing_client as C
 
+# Set tunables directly on the module so the tests are independent of import
+# order (env vars only take effect if read before the module was first imported,
+# which isn't guaranteed when another suite imports it first).
+C.NO_WORK_POLL_SECONDS = 0  # don't really sleep when the server says no_work
 
-def load_db_config():
-    with open('config/db_config.json', 'r') as f:
-        return json.load(f)
+# Run to_thread work inline (no executor needed in the test environment).
+async def _inline(fn, *a, **k):
+    return fn(*a, **k)
+asyncio.to_thread = _inline
 
-
-def test_get_pending_tasks():
-    """Test getting pending tasks from database."""
-    logger.info("=" * 60)
-    logger.info("Testing get_pending_tasks()")
-    logger.info("=" * 60)
-    
-    db_params = load_db_config()
-    conn = psycopg2.connect(**db_params)
-    conn.autocommit = False
-    
-    try:
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT COUNT(*) 
-            FROM VID_MODEL_STATE 
-            WHERE STATE IS NULL
-        """)
-        count = cursor.fetchone()[0]
-        
-        if count > 0:
-            logger.info(f"Found {count} pending tasks")
-            
-            task = async_processing_client.get_pending_tasks(
-                logger, batch_size=10, n_gram_size=4, conn=conn
-            )
-            
-            if task:
-                logger.info(f"✓ Successfully retrieved pending task")
-                logger.info(f"  Video ID: {task['additional_data']['vid_id']}")
-                logger.info(f"  Model keys: {task['additional_data']['model_keys']}")
-                logger.info(f"  N-gram size: {task['additional_data']['n_gram_size']}")
-                logger.info("✓ Test PASSED")
-            else:
-                logger.warning("✗ No task returned")
-        else:
-            logger.warning("⚠ No pending tasks found - skipping test")
-        
-        conn.rollback()
-        logger.info("✓ Transaction rolled back - no permanent changes")
-        
-    except Exception as e:
-        logger.error(f"Error in test_get_pending_tasks: {e}", exc_info=True)
-        conn.rollback()
-    finally:
-        conn.close()
+_LOG = logging.getLogger("test_async_client")
 
 
-def test_get_transcript():
-    """Test getting transcript."""
-    logger.info("\n" + "=" * 60)
-    logger.info("Testing get_transcript()")
-    logger.info("=" * 60)
-    
-    db_params = load_db_config()
-    conn = psycopg2.connect(**db_params)
-    conn.autocommit = False
-    
-    try:
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT VID_ID 
-            FROM VID_TRANSCRIPT_TABLE
-            WHERE WORD_COUNT > 0
-            LIMIT 1
-        """)
-        result = cursor.fetchone()
-        
-        if result:
-            vid_id = result[0]
-            logger.info(f"Testing with video ID: {vid_id}")
-            
-            transcript = async_processing_client.get_transcript(vid_id, 4, conn)
-            
-            if transcript:
-                logger.info(f"✓ Successfully retrieved transcript")
-                logger.info(f"  Transcript length: {len(transcript)} tokens")
-                logger.info("✓ Test PASSED")
-            else:
-                logger.warning("✗ No transcript returned")
-        else:
-            logger.warning("⚠ No videos with transcripts found - skipping test")
-        
-        conn.rollback()
-        
-    except Exception as e:
-        logger.error(f"Error in test_get_transcript: {e}", exc_info=True)
-        conn.rollback()
-    finally:
-        conn.close()
+def _make_client(pool):
+    client = C.ProcessingClient("h", "box", 5000, _LOG, {}, pool)
+    return client
 
 
-def test_load_model_from_db():
-    """Test loading models from database."""
-    logger.info("\n" + "=" * 60)
-    logger.info("Testing load_model_from_db()")
-    logger.info("=" * 60)
-    
-    db_params = load_db_config()
-    conn = psycopg2.connect(**db_params)
-    conn.autocommit = False
-    
-    try:
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT MODEL_KEY FROM MODEL_TABLE LIMIT 1")
-        result = cursor.fetchone()
-        
-        if result:
-            model_key = result[0]
-            logger.info(f"Testing with model key: {model_key}")
-            
-            model_keys = [model_key]
-            loaded_models = async_processing_client.load_model_from_db(conn, model_keys, logger)
-            
-            if loaded_models and model_key in loaded_models:
-                logger.info(f"✓ Successfully loaded model {model_key}")
-                logger.info(f"  Model type: {type(loaded_models[model_key])}")
-                logger.info("✓ Test PASSED")
-            else:
-                logger.warning("✗ Model not loaded")
-        else:
-            logger.warning("⚠ No models found - skipping test")
-        
-        conn.rollback()
-        
-    except Exception as e:
-        logger.error(f"Error in test_load_model_from_db: {e}", exc_info=True)
-        conn.rollback()
-    finally:
-        conn.close()
+def test_ensure_model_lru_eviction():
+    async def go():
+        saved_cap = C.MODEL_CACHE_SIZE
+        C.MODEL_CACHE_SIZE = 2  # force a small cache so eviction is observable
+        try:
+            pool = ts.FakePool(models={1: ts.FakeModel(), 2: ts.FakeModel(), 3: ts.FakeModel()})
+            c = _make_client(pool)
+            await c.ensure_model(1)
+            await c.ensure_model(2)
+            ts.check("two models cached", set(c.model_cache.keys()) == {1, 2})
+            await c.ensure_model(3)  # cache size is 2 -> model 1 (LRU) evicted
+            ts.check("cache stays at capacity", len(c.model_cache) == 2)
+            ts.check("least-recently-used model evicted", 1 not in c.model_cache and 3 in c.model_cache)
+            await c.ensure_model(2)  # touch 2 -> now MRU
+            await c.ensure_model(1)  # evicts 3 (LRU), keeps 2
+            ts.check("touching a model protects it from eviction", set(c.model_cache.keys()) == {2, 1})
+        finally:
+            C.MODEL_CACHE_SIZE = saved_cap
+    asyncio.run(go())
 
 
-def test_save_results():
-    """Test saving results."""
-    logger.info("\n" + "=" * 60)
-    logger.info("Testing save_results()")
-    logger.info("=" * 60)
-    
-    db_params = load_db_config()
-    conn = psycopg2.connect(**db_params)
-    conn.autocommit = False
-    
-    try:
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT VID_ID, MODEL_KEY
-            FROM VID_TABLE v, MODEL_TABLE m
-            LIMIT 1
-        """)
-        result = cursor.fetchone()
-        
-        if not result:
-            logger.warning("⚠ No videos or models found - skipping test")
-            return
-        
-        vid_id = result[0]
-        model_key = result[1]
-        
-        logger.info(f"Testing with video {vid_id}, model {model_key}")
-        
-        test_results = [{
-            'model_key': model_key,
-            'score': [0.1, 0.2, 0.3],
-            'time_taken': 0.5
-        }]
-        
-        async_processing_client.save_results(vid_id, test_results, conn)
-        
-        cursor.execute("""
-            SELECT SCORE
-            FROM VID_SCORE_TABLE
-            WHERE VID_ID = %s AND MODEL_KEY = %s
-        """, (vid_id, model_key))
-        
-        saved = cursor.fetchone()
-        
-        if saved:
-            logger.info(f"✓ Successfully saved results")
-            logger.info(f"  Score array: {saved[0]}")
-            logger.info("✓ Test PASSED")
-        else:
-            logger.error("✗ Results not saved")
-        
-        conn.rollback()
-        logger.info("✓ Transaction rolled back - no permanent changes")
-        
-    except Exception as e:
-        logger.error(f"Error in test_save_results: {e}", exc_info=True)
-        conn.rollback()
-    finally:
-        conn.close()
+def test_process_model_scores_and_saves():
+    async def go():
+        pool = ts.FakePool(
+            models={7: ts.FakeModel(0.5)},
+            pending_ids=[101, 102],
+            transcript_segments=["alpha beta gamma delta epsilon"],
+        )
+        c = _make_client(pool)
+        C.execute_values = ts.make_capturing_execute_values(pool)
+        c.send_data = _collect(c)
+        c.client_state = "play"
+        scored = await c.process_model(7)
+        ts.check("scored every pending video", scored == 2)
+        ts.check("two score rows saved", len(pool.saved) == 2)
+        ts.check("rows tagged with model_id 7", all(r[1] == 7 for r in pool.saved))
+        ts.check("score arrays non-empty", all(len(r[2]) > 0 for r in pool.saved))
+        ts.check("model cached after use", 7 in c.model_cache)
+    asyncio.run(go())
 
 
-def test_mark_tasks_complete():
-    """Test marking tasks as complete."""
-    logger.info("\n" + "=" * 60)
-    logger.info("Testing mark_tasks_complete()")
-    logger.info("=" * 60)
-    
-    db_params = load_db_config()
-    conn = psycopg2.connect(**db_params)
-    conn.autocommit = False
-    
-    try:
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT VID_ID, MODEL_KEY
-            FROM VID_MODEL_STATE
-            WHERE STATE IS NULL
-            LIMIT 1
-        """)
-        result = cursor.fetchone()
-        
-        if result:
-            vid_id = result[0]
-            model_key = result[1]
-            
-            logger.info(f"Testing with video {vid_id}, model {model_key}")
-            
-            cursor.execute("""
-                UPDATE VID_MODEL_STATE 
-                SET STATE = 'pending'
-                WHERE VID_ID = %s AND MODEL_KEY = %s
-            """, (vid_id, model_key))
-            conn.commit()
-            
-            test_results = [{'model_key': model_key}]
-            async_processing_client.mark_tasks_complete(vid_id, test_results, logger, conn)
-            
-            cursor.execute("""
-                SELECT STATE
-                FROM VID_MODEL_STATE
-                WHERE VID_ID = %s AND MODEL_KEY = %s
-            """, (vid_id, model_key))
-            
-            state_result = cursor.fetchone()
-            
-            if state_result and state_result[0] == 'complete':
-                logger.info("✓ Successfully marked task as complete")
-                logger.info("✓ Test PASSED")
-            else:
-                logger.error(f"✗ Task state is {state_result[0] if state_result else 'None'}, expected 'complete'")
-        else:
-            logger.warning("⚠ No tasks found - skipping test")
-        
-        conn.rollback()
-        logger.info("✓ Transaction rolled back - no permanent changes")
-        
-    except Exception as e:
-        logger.error(f"Error in test_mark_tasks_complete: {e}", exc_info=True)
-        conn.rollback()
-    finally:
-        conn.close()
+def test_request_model_assignment_and_no_work():
+    async def go():
+        pool = ts.FakePool(models={7: ts.FakeModel()})
+        c = _make_client(pool)
+        sent = []
+        # Reply to each work_request like the server would.
+        scripted = [{"packet_type": "assignment", "additional_data": {"model_id": 7}},
+                    {"packet_type": "no_work", "additional_data": {}}]
+
+        async def send(p):
+            sent.append(p)
+            if p["packet_type"] == "work_request":
+                c.assignment_queue.put_nowait(scripted.pop(0))
+        c.send_data = send
+
+        await c.ensure_model(7)
+        mid = await asyncio.wait_for(c.request_model(), 5)
+        ts.check("assignment returns model id", mid == 7)
+        wr = [p for p in sent if p["packet_type"] == "work_request"][-1]
+        ts.check("work_request reports loaded models", wr["additional_data"]["loaded_models"] == [7])
+        mid2 = await asyncio.wait_for(c.request_model(), 5)
+        ts.check("no_work returns None", mid2 is None)
+    asyncio.run(go())
+
+
+def test_worker_loop_completes_model():
+    async def go():
+        pool = ts.FakePool(
+            models={7: ts.FakeModel(0.5)},
+            pending_ids=[101, 102],
+            transcript_segments=["alpha beta gamma delta"],
+        )
+        c = _make_client(pool)
+        C.execute_values = ts.make_capturing_execute_values(pool)
+        sent = []
+        scripted = [{"packet_type": "assignment", "additional_data": {"model_id": 7}},
+                    {"packet_type": "no_work", "additional_data": {}}]
+
+        async def send(p):
+            sent.append(p)
+            if p["packet_type"] == "work_request":
+                reply = scripted.pop(0) if scripted else {"packet_type": "no_work", "additional_data": {}}
+                if reply["packet_type"] == "no_work":
+                    c.client_state = "pause"  # let the loop exit after draining
+                c.assignment_queue.put_nowait(reply)
+        c.send_data = send
+        c.client_state = "play"
+
+        await asyncio.wait_for(c.worker_loop(), 8)
+        mc = [p for p in sent if p["packet_type"] == "model_complete"]
+        ts.check("model_complete sent", bool(mc))
+        ts.check("model_complete reports model + count",
+                 mc[-1]["additional_data"] == {"model_id": 7, "scored_count": 2})
+        ts.check("scores persisted", len(pool.saved) == 2)
+    asyncio.run(go())
+
+
+def _collect(client):
+    async def send(_p):
+        return None
+    return send
 
 
 def run_all_tests():
-    """Run all async client function tests."""
-    logger.info("\n" + "=" * 60)
-    logger.info("ASYNC CLIENT FUNCTION TESTS")
-    logger.info("=" * 60)
-    
-    try:
-        test_get_pending_tasks()
-        test_get_transcript()
-        test_load_model_from_db()
-        test_save_results()
-        test_mark_tasks_complete()
-        
-        logger.info("\n" + "=" * 60)
-        logger.info("All async client function tests completed!")
-        logger.info("=" * 60)
-        
-    except Exception as e:
-        logger.error(f"Critical error in test suite: {e}", exc_info=True)
+    print("\n=== ASYNC CLIENT (model-major) TESTS (offline) ===")
+    test_ensure_model_lru_eviction()
+    test_process_model_scores_and_saves()
+    test_request_model_assignment_and_no_work()
+    test_worker_loop_completes_model()
+    print("All async client function tests passed.")
 
 
 if __name__ == "__main__":
