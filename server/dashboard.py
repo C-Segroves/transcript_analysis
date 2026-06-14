@@ -124,7 +124,7 @@ def fetch_channels(db_config, logger):
         FROM channel_table c
         LEFT JOIN vid_table v ON v.channel_id = c.id
         LEFT JOIN vid_transcript_table t ON t.vid_id = v.id
-        GROUP BY c.id, c.channel_handle, c.channel_snippet, c.yt_channel_id, c.insert_at
+        GROUP BY c.id
         ORDER BY c.insert_at DESC NULLS LAST, c.id DESC
     """
     conn = None
@@ -150,6 +150,48 @@ def fetch_channels(db_config, logger):
     finally:
         if conn is not None:
             conn.close()
+
+
+def fetch_island_stats(db_config, logger):
+    """
+    Island pipeline progress. Returns a dict; 'available' is False if the island
+    tables haven't been created yet (setup_island_tables.py not run).
+    """
+    stats = {
+        "available": False,
+        "islands": None,
+        "pending": 0,
+        "in_progress": 0,
+        "done": 0,
+        "error": 0,
+        "total_tasks": 0,
+    }
+    conn = None
+    try:
+        conn = _get_connection(db_config)
+        with conn.cursor() as cur:
+            # Does island_task_table exist?
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'island_task_table'
+                );
+            """)
+            if not cur.fetchone()[0]:
+                return stats
+            stats["available"] = True
+            stats["islands"] = _scalar(cur, "SELECT COUNT(*) FROM island_table")
+            cur.execute("SELECT status, COUNT(*) FROM island_task_table GROUP BY status")
+            for status, count in cur.fetchall():
+                if status in stats:
+                    stats[status] = count
+                stats["total_tasks"] += count
+    except Exception as e:
+        logger.error(f"Dashboard: failed to fetch island stats: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +290,40 @@ def _esc(s):
     return html.escape(str(s))
 
 
-def render_page(stats, channels, message=None, message_ok=True):
+def render_island_section(island_stats):
+    if not island_stats or not island_stats.get("available"):
+        return """
+  <h2>Islands</h2>
+  <div class="hint">Island tables not found yet. Create them with
+  <code>python setup_island_tables.py --refresh</code>, then run an island worker.</div>"""
+
+    done = island_stats.get("done", 0) or 0
+    total = island_stats.get("total_tasks", 0) or 0
+    pct = f"{(done / total) * 100:.1f}%" if total else "—"
+    cards = [
+        ("Islands found", island_stats.get("islands"), "rows in island_table"),
+        ("Tasks done", done, f"{pct} of {_fmt(total)}"),
+        ("Pending", island_stats.get("pending"), "waiting for a worker"),
+        ("In progress", island_stats.get("in_progress"), "claimed by a worker"),
+        ("Errored", island_stats.get("error"), "will retry up to max attempts"),
+    ]
+    card_html = "\n".join(
+        f"""
+        <div class="card">
+          <div class="card-label">{_esc(label)}</div>
+          <div class="card-value">{_fmt(value)}</div>
+          <div class="card-sub">{sub}</div>
+        </div>"""
+        for label, value, sub in cards
+    )
+    return f"""
+  <h2>Islands</h2>
+  <div class="cards">
+    {card_html}
+  </div>"""
+
+
+def render_page(stats, channels, message=None, message_ok=True, island_stats=None):
     pct = ""
     if stats.get("transcripts_downloaded") and stats.get("videos_processed") is not None:
         try:
@@ -277,7 +352,7 @@ def render_page(stats, channels, message=None, message_ok=True):
     )
 
     if channels is None:
-        rows_html = '<tr><td colspan="5" class="muted">Could not load channels (database unreachable).</td></tr>'
+        rows_html = '<tr><td colspan="5" class="muted">Could not load the channel list (query error — check the server logs).</td></tr>'
     elif not channels:
         rows_html = '<tr><td colspan="5" class="muted">No channels yet. Add one above.</td></tr>'
     else:
@@ -306,6 +381,8 @@ def render_page(stats, channels, message=None, message_ok=True):
                 </tr>"""
             )
         rows_html = "\n".join(rows)
+
+    island_section = render_island_section(island_stats)
 
     banner = ""
     if message:
@@ -370,6 +447,7 @@ def render_page(stats, channels, message=None, message_ok=True):
   <div class="cards">
     {card_html}
   </div>
+{island_section}
 
   <h2>Add a channel</h2>
   <form class="add" method="post" action="/add-channel">
@@ -422,7 +500,10 @@ def make_handler(db_config, api_key_path, logger):
         def _render(self, message=None, message_ok=True, status=200):
             stats = fetch_stats(db_config, logger)
             channels = fetch_channels(db_config, logger)
-            self._send_html(render_page(stats, channels, message, message_ok), status)
+            island_stats = fetch_island_stats(db_config, logger)
+            self._send_html(
+                render_page(stats, channels, message, message_ok, island_stats), status
+            )
 
         def do_GET(self):
             path = urllib.parse.urlparse(self.path).path
