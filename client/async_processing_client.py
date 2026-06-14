@@ -182,16 +182,21 @@ def db_get_pending_video_ids(db_pool, model_id, logger):
     conn = db_pool.getconn()
     try:
         with conn.cursor() as cur:
+            # EXISTS/NOT EXISTS (semi-joins) instead of JOIN+GROUP BY so the planner
+            # can satisfy this with index probes: one per video against the
+            # transcript index and the (vid_id, model_id) score index, rather than
+            # scanning the whole transcript/score tables.
             cur.execute("""
                 SELECT v.id
                 FROM vid_table v
-                JOIN vid_transcript_table vt ON vt.vid_id = v.id
-                WHERE vt.word_count > 0
+                WHERE EXISTS (
+                        SELECT 1 FROM vid_transcript_table vt
+                        WHERE vt.vid_id = v.id AND vt.word_count > 0
+                      )
                   AND NOT EXISTS (
-                      SELECT 1 FROM vid_score_table vs
-                      WHERE vs.vid_id = v.id AND vs.model_id = %s
-                  )
-                GROUP BY v.id
+                        SELECT 1 FROM vid_score_table vs
+                        WHERE vs.vid_id = v.id AND vs.model_id = %s
+                      )
                 ORDER BY v.id
             """, (model_id,))
             return [r[0] for r in cur.fetchall()]
@@ -230,20 +235,20 @@ def db_load_models(db_pool, model_ids, logger):
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, external_key, model_data FROM model_table WHERE id = ANY(%s)",
+                "SELECT id, yt_model_key, model_data FROM model_table WHERE id = ANY(%s)",
                 (list(model_ids),),
             )
             rows = cur.fetchall()
-        for model_id, external_key, model_data in rows:
+        for model_id, yt_model_key, model_data in rows:
             try:
                 if isinstance(model_data, memoryview):
                     model_data = model_data.tobytes()
                 if not model_data:
-                    logger.error(f"Model {model_id} ({external_key}) has empty data.")
+                    logger.error(f"Model {model_id} ({yt_model_key}) has empty data.")
                     continue
                 loaded[model_id] = pickle.loads(model_data)
             except Exception as e:
-                logger.error(f"Failed to unpickle model {model_id} ({external_key}): {e}")
+                logger.error(f"Failed to unpickle model {model_id} ({yt_model_key}): {e}")
         return loaded
     except psycopg2.Error as e:
         logger.error(f"DB error loading models {list(model_ids)}: {e}")
@@ -260,12 +265,15 @@ def db_save_scores(db_pool, rows, logger):
     conn = db_pool.getconn()
     try:
         with conn.cursor() as cur:
+            # Plain insert: model-major scoring only saves (vid_id, model_id) pairs
+            # that had no score yet (db_get_pending_video_ids filters on NOT EXISTS),
+            # so there is nothing to conflict with. (vid_score_table has only a
+            # non-unique index on (vid_id, model_id), so ON CONFLICT isn't available
+            # anyway.) To force a re-score, delete the old rows first.
             execute_values(cur, """
                 INSERT INTO vid_score_table (vid_id, model_id, score, insert_at)
                 VALUES %s
-                ON CONFLICT (vid_id, model_id)
-                DO UPDATE SET score = EXCLUDED.score, insert_at = CURRENT_TIMESTAMP
-            """, [(vid_id, model_id, score, ) for (vid_id, model_id, score) in rows],
+            """, [(vid_id, model_id, score) for (vid_id, model_id, score) in rows],
                 template="(%s, %s, %s, CURRENT_TIMESTAMP)")
         conn.commit()
         return len(rows)
