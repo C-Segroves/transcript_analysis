@@ -25,13 +25,35 @@ Start it with: start_dashboard_in_thread(db_config, api_key_path, logger, host, 
 import html
 import json
 import logging
+import os
 import threading
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psycopg2
+
+# Cap any single dashboard query so a slow one degrades to "—" instead of
+# hanging the page, and cache the (DB-backed) sections so rapid reloads and
+# multiple viewers don't re-run the aggregates every time.
+STATEMENT_TIMEOUT_MS = int(os.getenv("DASHBOARD_STATEMENT_TIMEOUT_MS", "15000"))
+CACHE_TTL_SECONDS = float(os.getenv("DASHBOARD_CACHE_TTL", "30"))
+_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _cached(key, producer):
+    """Return a cached value if fresh, else recompute under a lock."""
+    now = time.time()
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+        if hit and hit[1] > now:
+            return hit[0]
+        value = producer()
+        _CACHE[key] = (value, now + CACHE_TTL_SECONDS)
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +83,14 @@ def load_api_key(path=DEFAULT_API_KEY_PATH):
 # ---------------------------------------------------------------------------
 
 def _get_connection(db_config):
-    return psycopg2.connect(**db_config)
+    conn = psycopg2.connect(**db_config)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+        conn.commit()
+    except Exception:
+        pass
+    return conn
 
 
 def _scalar(cur, query):
@@ -87,6 +116,8 @@ def fetch_stats(db_config, logger):
         "videos_with_info": None,
         "transcripts_downloaded": None,
         "videos_processed": None,
+        "models": None,
+        "score_rows_est": None,
     }
     conn = None
     try:
@@ -97,11 +128,24 @@ def fetch_stats(db_config, logger):
             stats["videos_with_info"] = _scalar(
                 cur, "SELECT COUNT(DISTINCT vid_id) FROM vid_data_table"
             )
+            # Count distinct videos via EXISTS over the small vid_table (75k rows)
+            # using the (vid_id, …) indexes, instead of COUNT(DISTINCT vid_id)
+            # which would full-scan the 45M / 128M row tables on every load.
             stats["transcripts_downloaded"] = _scalar(
-                cur, "SELECT COUNT(DISTINCT vid_id) FROM vid_transcript_table"
+                cur,
+                "SELECT COUNT(*) FROM vid_table v "
+                "WHERE EXISTS (SELECT 1 FROM vid_transcript_table t WHERE t.vid_id = v.id)",
             )
             stats["videos_processed"] = _scalar(
-                cur, "SELECT COUNT(DISTINCT vid_id) FROM vid_score_table"
+                cur,
+                "SELECT COUNT(*) FROM vid_table v "
+                "WHERE EXISTS (SELECT 1 FROM vid_score_table s WHERE s.vid_id = v.id)",
+            )
+            stats["models"] = _scalar(cur, "SELECT COUNT(*) FROM model_table")
+            # Estimate of total score rows (one per scored vid+model pair). Exact
+            # COUNT(*) would scan 128M rows; reltuples is a fast planner estimate.
+            stats["score_rows_est"] = _scalar(
+                cur, "SELECT reltuples::bigint FROM pg_class WHERE relname = 'vid_score_table'"
             )
     except Exception as e:
         logger.error(f"Dashboard: failed to fetch stats: {e}")
@@ -113,17 +157,20 @@ def fetch_stats(db_config, logger):
 
 def fetch_channels(db_config, logger):
     """Return a list of channel rows with per-channel video/transcript counts."""
+    # Avoid joining the 45M-row transcript table: scan the small vid_table and
+    # probe the transcript index once per video via EXISTS (in a FILTER).
     query = """
         SELECT
             c.channel_handle,
             c.channel_snippet->>'title' AS title,
             c.yt_channel_id,
-            COUNT(DISTINCT v.id) AS videos,
-            COUNT(DISTINCT t.vid_id) AS transcripts,
+            COUNT(v.id) AS videos,
+            COUNT(v.id) FILTER (
+                WHERE EXISTS (SELECT 1 FROM vid_transcript_table t WHERE t.vid_id = v.id)
+            ) AS transcripts,
             c.insert_at
         FROM channel_table c
         LEFT JOIN vid_table v ON v.channel_id = c.id
-        LEFT JOIN vid_transcript_table t ON t.vid_id = v.id
         GROUP BY c.id
         ORDER BY c.insert_at DESC NULLS LAST, c.id DESC
     """
@@ -385,21 +432,45 @@ def render_island_section(island_stats):
 
 
 def render_page(stats, channels, message=None, message_ok=True, island_stats=None, worker_snapshot=None):
-    pct = ""
-    if stats.get("transcripts_downloaded") and stats.get("videos_processed") is not None:
+    def _compact(n):
         try:
-            denom = stats["transcripts_downloaded"]
-            if denom:
-                pct = f"{(stats['videos_processed'] / denom) * 100:.1f}%"
-        except Exception:
-            pct = ""
+            n = float(n)
+        except (TypeError, ValueError):
+            return "?"
+        if n >= 1e9:
+            return f"{n / 1e9:.1f}B"
+        if n >= 1e6:
+            return f"{n / 1e6:.0f}M"
+        if n >= 1e3:
+            return f"{n / 1e3:.0f}K"
+        return str(int(n))
+
+    # "Videos processed" = videos with at least one model score (coverage), not
+    # fully-scored videos. Keep it but label it honestly.
+    cov_pct = ""
+    if stats.get("transcripts_downloaded") and stats.get("videos_processed") is not None:
+        denom = stats["transcripts_downloaded"]
+        if denom:
+            cov_pct = f"{(stats['videos_processed'] / denom) * 100:.1f}%"
+
+    # True scoring progress is over (video x model) pairs: expected = videos with
+    # a transcript x number of models; done ~= score rows.
+    models = stats.get("models") or 0
+    transcripts = stats.get("transcripts_downloaded") or 0
+    score_rows = stats.get("score_rows_est") or 0
+    expected_pairs = transcripts * models
+    pair_sub = "—"
+    if expected_pairs:
+        pair_sub = f"~{(score_rows / expected_pairs) * 100:.1f}% of ~{_compact(expected_pairs)} pairs"
 
     cards = [
         ("Channels", stats.get("channels"), "channels tracked"),
         ("Videos discovered", stats.get("videos_discovered"), "in vid_table"),
         ("Videos with info", stats.get("videos_with_info"), "title/description pulled"),
         ("Transcripts downloaded", stats.get("transcripts_downloaded"), "have transcript text"),
-        ("Videos processed", stats.get("videos_processed"), f"scored{(' · ' + pct + ' of transcripts') if pct else ''}"),
+        ("Videos with a score", stats.get("videos_processed"),
+         f"≥1 model{(' · ' + cov_pct + ' of transcripts') if cov_pct else ''}"),
+        ("Scoring progress", score_rows, pair_sub + f" ({_fmt(models)} models)"),
     ]
 
     card_html = "\n".join(
@@ -561,9 +632,12 @@ def make_handler(db_config, api_key_path, logger, status_provider=None):
             self.wfile.write(encoded)
 
         def _render(self, message=None, message_ok=True, status=200):
-            stats = fetch_stats(db_config, logger)
-            channels = fetch_channels(db_config, logger)
-            island_stats = fetch_island_stats(db_config, logger)
+            # Cache the DB-backed sections (short TTL) so reloads and multiple
+            # viewers don't re-run the aggregates each time. The worker snapshot
+            # is in-memory and always live.
+            stats = _cached("stats", lambda: fetch_stats(db_config, logger))
+            channels = _cached("channels", lambda: fetch_channels(db_config, logger))
+            island_stats = _cached("islands", lambda: fetch_island_stats(db_config, logger))
             worker_snapshot = None
             if status_provider is not None:
                 try:

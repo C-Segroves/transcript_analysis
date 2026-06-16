@@ -27,6 +27,7 @@ import json
 import os
 
 import psycopg2
+from psycopg2.extras import execute_values
 
 
 def load_db_config(config_path=None):
@@ -89,26 +90,65 @@ DROP_TABLES = [
 # Task seeding
 # ---------------------------------------------------------------------------
 
-# Insert a pending task for every (vid_id, model_id) that has a non-empty score
-# array and does not already have a task row. Existing tasks are left untouched,
-# so completed/in-progress work is never reset.
-REFRESH_TASKS_SQL = """
-INSERT INTO island_task_table (vid_id, model_id, status)
-SELECT vs.vid_id, vs.model_id, 'pending'
-FROM vid_score_table vs
-WHERE vs.score IS NOT NULL
-  AND COALESCE(array_length(vs.score, 1), 0) > 0
-ON CONFLICT (vid_id, model_id) DO NOTHING;
-"""
+def refresh_tasks(conn, batch_size=50000, logger=None):
+    """
+    Seed a pending island task for every (vid_id, model_id) in vid_score_table.
 
+    Done in committed batches using keyset pagination over the
+    (vid_id, model_id) index, so:
+      * each batch is its own small transaction (no giant 128M-row transaction),
+      * it's restartable -- it resumes after the highest (vid_id, model_id)
+        already in island_task_table, so re-running continues where it left off,
+      * memory stays bounded.
 
-def refresh_tasks(conn):
-    """Seed pending island tasks from vid_score_table. Returns rows added."""
-    with conn.cursor() as cur:
-        cur.execute(REFRESH_TASKS_SQL)
-        added = cur.rowcount
-    conn.commit()
-    return added
+    Pairs with empty score arrays are seeded too; the worker handles them as
+    0-island no-ops, which keeps the seed an index-only scan (no heap lookups).
+
+    Re-running after more scoring correctly tops up: it scans the whole table in
+    key order (ON CONFLICT skips pairs that already have a task). It does NOT
+    "resume from the max key", because model-major scoring adds a new model's
+    rows across the entire video range -- those sort below the old max key and a
+    resume-from-max would miss them.
+
+    Returns the number of scored pairs scanned this run.
+    """
+    def log(msg):
+        if logger:
+            logger.info(msg)
+        else:
+            print(msg)
+
+    last_vid, last_model = -1, -1
+    total = 0
+    while True:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT vs.vid_id, vs.model_id
+                FROM vid_score_table vs
+                WHERE (vs.vid_id, vs.model_id) > (%s, %s)
+                ORDER BY vs.vid_id, vs.model_id
+                LIMIT %s
+                """,
+                (last_vid, last_model, batch_size),
+            )
+            page = cur.fetchall()
+            if not page:
+                break
+            execute_values(
+                cur,
+                "INSERT INTO island_task_table (vid_id, model_id, status) VALUES %s "
+                "ON CONFLICT (vid_id, model_id) DO NOTHING",
+                [(v, m, "pending") for (v, m) in page],
+                template="(%s, %s, %s)",
+            )
+        conn.commit()
+        total += len(page)
+        last_vid, last_model = page[-1]
+        log(f"Seeded {total:,} island task(s) (through vid_id={last_vid})...")
+
+    log(f"Island-task seeding complete: {total:,} pair(s) processed this run.")
+    return total
 
 
 # ---------------------------------------------------------------------------

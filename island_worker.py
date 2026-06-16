@@ -197,8 +197,8 @@ def run(db_params, params, logger, batch=10, once=False, poll_seconds=DEFAULT_PO
         ensure_tables(conn)
 
         if refresh_first:
-            added = refresh_tasks(conn)
-            logger.info("Seeded %d new pending task(s) from vid_score_table.", added)
+            added = refresh_tasks(conn, logger=logger)
+            logger.info("Island-task seeding pass done (%d pair(s) processed).", added)
 
         idle_logged = False
         while True:
