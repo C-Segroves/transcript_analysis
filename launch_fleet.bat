@@ -47,20 +47,23 @@ echo ^>^> Building images (scoring client + island worker)...
 docker build -t transcript-client -f client\Dockerfile . || exit /b 1
 docker build -t transcript-island-worker -f island_worker\Dockerfile . || exit /b 1
 
+REM Note: config is baked into the images at build time (the Dockerfiles COPY
+REM config\db_config.json), and we rebuild every run, so no -v mount is needed.
+REM Avoiding -v also sidesteps Windows drive-letter/colon volume-path issues.
 if "%SEED%"=="1" (
     echo ^>^> Seeding island tasks from existing scores (one-time)...
-    docker run --rm -v "%CD%\config:/app/config:ro" --entrypoint python transcript-island-worker setup_island_tables.py --refresh
+    docker run --rm --entrypoint python transcript-island-worker setup_island_tables.py --refresh
 )
 
 echo ^>^> Launching %CLIENTS% scoring client(s) + %ISLANDS% island worker(s) -^> server %SERVER_HOST%
 for /L %%i in (1,1,%CLIENTS%) do (
     docker rm -f %HOST%-client-%%i >nul 2>&1
-    docker run -d --restart unless-stopped --name %HOST%-client-%%i -e SERVER_HOST=%SERVER_HOST% -e MACHINE_NAME=%HOST%-c%%i -e MODEL_CACHE_SIZE=1 -v "%CD%\config:/app/config:ro" transcript-client >nul
+    docker run -d --restart unless-stopped --name %HOST%-client-%%i -e SERVER_HOST=%SERVER_HOST% -e MACHINE_NAME=%HOST%-c%%i -e MODEL_CACHE_SIZE=1 transcript-client
 )
 
 for /L %%i in (1,1,%ISLANDS%) do (
     docker rm -f %HOST%-island-%%i >nul 2>&1
-    docker run -d --restart unless-stopped --name %HOST%-island-%%i -e WORKER_NAME=%HOST%-isl%%i -v "%CD%\config:/app/config:ro" transcript-island-worker >nul
+    docker run -d --restart unless-stopped --name %HOST%-island-%%i -e WORKER_NAME=%HOST%-isl%%i transcript-island-worker
 )
 
 echo ^>^> Running. Use "docker ps" to view, "docker logs -f %HOST%-client-1" to tail.

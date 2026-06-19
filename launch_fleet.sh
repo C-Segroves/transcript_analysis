@@ -46,10 +46,11 @@ echo ">> Building images (scoring client + island worker)..."
 docker build -t transcript-client        -f client/Dockerfile .
 docker build -t transcript-island-worker -f island_worker/Dockerfile .
 
+# Note: config is baked into the images at build time (the Dockerfiles COPY
+# config/db_config.json) and we rebuild every run, so no -v mount is needed.
 if [ "$SEED" = "1" ]; then
   echo ">> Seeding island tasks from existing scores (one-time)..."
-  docker run --rm -v "$PWD/config:/app/config:ro" \
-    --entrypoint python transcript-island-worker setup_island_tables.py --refresh
+  docker run --rm --entrypoint python transcript-island-worker setup_island_tables.py --refresh
 fi
 
 echo ">> Launching $CLIENTS scoring client(s) + $ISLANDS island worker(s) -> server $SERVER_HOST"
@@ -60,8 +61,7 @@ for i in $(seq 1 "$CLIENTS"); do
     -e SERVER_HOST="$SERVER_HOST" \
     -e MACHINE_NAME="${HOST}-c$i" \
     -e MODEL_CACHE_SIZE=1 \
-    -v "$PWD/config:/app/config:ro" \
-    transcript-client >/dev/null
+    transcript-client
 done
 
 for i in $(seq 1 "$ISLANDS"); do
@@ -69,8 +69,7 @@ for i in $(seq 1 "$ISLANDS"); do
   docker rm -f "$name" >/dev/null 2>&1 || true
   docker run -d --restart unless-stopped --name "$name" \
     -e WORKER_NAME="${HOST}-isl$i" \
-    -v "$PWD/config:/app/config:ro" \
-    transcript-island-worker >/dev/null
+    transcript-island-worker
 done
 
 echo ">> Running. Containers:"
