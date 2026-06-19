@@ -1,0 +1,10 @@
+# Normalize line endings so shell scripts always check out LF (Linux can run
+# them) and Windows batch files check out CRLF. Prevents the "bad interpreter"
+# / "$'\r'" errors and the spurious local-change diffs from sed -i.
+* text=auto
+
+*.sh   text eol=lf
+*.bash text eol=lf
+
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
