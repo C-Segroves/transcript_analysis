@@ -4,12 +4,16 @@ echo Building Client Image...
 cd /d "%~dp0"
 docker build -t my-client-image -f client\Dockerfile .
 
-REM Set SERVER_HOST to your task-server IP before running, e.g.:  set SERVER_HOST=your-server-ip
+REM Task-server host: use SERVER_HOST if set, else read "host" from config\db_config.json.
 if "%SERVER_HOST%"=="" (
-    echo ERROR: set SERVER_HOST to your task-server IP first ^(set SERVER_HOST=^<ip^>^).
+    for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "(ConvertFrom-Json (Get-Content config\db_config.json -Raw)).host"`) do set "SERVER_HOST=%%i"
+)
+if "%SERVER_HOST%"=="" (
+    echo ERROR: could not determine SERVER_HOST. Set it ^(set SERVER_HOST=^<ip^>^) or add "host" to config\db_config.json.
     pause
     exit /b 1
 )
+echo Using SERVER_HOST=%SERVER_HOST%
 
 if %errorlevel% equ 0 (
     echo Client image built successfully!
