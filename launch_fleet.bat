@@ -13,7 +13,7 @@ REM   4) launch_fleet.bat
 REM
 REM Usage:
 REM   launch_fleet.bat [num_clients] [num_island_workers]
-REM   set SERVER_HOST=192.168.1.204 & launch_fleet.bat     (override server ip)
+REM   set SERVER_HOST=<server-ip> & launch_fleet.bat       (override the task-server host)
 REM   set SEED=1 & launch_fleet.bat                         (ALSO seed islands)
 REM
 REM Run "set SEED=1" on exactly ONE machine, ONE time, to populate
@@ -22,7 +22,6 @@ REM ============================================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-if "%SERVER_HOST%"=="" set SERVER_HOST=192.168.1.204
 set CLIENTS=%1
 if "%CLIENTS%"=="" set CLIENTS=%NUMBER_OF_PROCESSORS%
 set ISLANDS=%2
@@ -31,6 +30,16 @@ set HOST=%COMPUTERNAME%
 
 if not exist config\db_config.json (
     echo ERROR: config\db_config.json not found. Copy it onto this machine first.
+    exit /b 1
+)
+
+REM Task-server host: use SERVER_HOST if set, else the "host" from config\db_config.json
+REM (task server and DB share a machine in this setup).
+if "%SERVER_HOST%"=="" (
+    for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "(ConvertFrom-Json (Get-Content config\db_config.json -Raw)).host"`) do set "SERVER_HOST=%%i"
+)
+if "%SERVER_HOST%"=="" (
+    echo ERROR: could not determine SERVER_HOST. Set it ^(set SERVER_HOST=^<ip^>^) or add "host" to config\db_config.json.
     exit /b 1
 )
 

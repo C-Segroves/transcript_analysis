@@ -196,6 +196,7 @@ def db_get_pending_video_ids(db_pool, model_id, logger):
                   AND NOT EXISTS (
                         SELECT 1 FROM vid_score_table vs
                         WHERE vs.vid_id = v.id AND vs.model_id = %s
+                          AND cardinality(vs.score) > 0
                       )
                 ORDER BY v.id
             """, (model_id,))
@@ -265,11 +266,16 @@ def db_save_scores(db_pool, rows, logger):
     conn = db_pool.getconn()
     try:
         with conn.cursor() as cur:
-            # Plain insert: model-major scoring only saves (vid_id, model_id) pairs
-            # that had no score yet (db_get_pending_video_ids filters on NOT EXISTS),
-            # so there is nothing to conflict with. (vid_score_table has only a
-            # non-unique index on (vid_id, model_id), so ON CONFLICT isn't available
-            # anyway.) To force a re-score, delete the old rows first.
+            # vid_score_table has no unique key, so we can't upsert. Delete any
+            # existing rows for these (vid_id, model_id) pairs first, then insert.
+            # This replaces stale empty-score rows being re-scored and prevents
+            # duplicate rows for a pair (which would break the island reader).
+            execute_values(cur, """
+                DELETE FROM vid_score_table vs
+                USING (VALUES %s) AS d(vid_id, model_id)
+                WHERE vs.vid_id = d.vid_id AND vs.model_id = d.model_id
+            """, [(vid_id, model_id) for (vid_id, model_id, score) in rows],
+                template="(%s, %s)")
             execute_values(cur, """
                 INSERT INTO vid_score_table (vid_id, model_id, score, insert_at)
                 VALUES %s

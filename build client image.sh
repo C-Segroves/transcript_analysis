@@ -1,12 +1,17 @@
 #!/bin/bash
 echo "Building Client Image..."
 
-# Set the SERVER_HOST environment variable (passed as an argument or default to a known IP)
-SERVER_HOST=${1:-192.168.1.108}  # Replace with the actual server IP if known
+# Task-server host: pass as arg 1, or set SERVER_HOST, or it falls back to the
+# "host" field in config/db_config.json.
+cd "$(dirname "$0")"
+SERVER_HOST=${1:-${SERVER_HOST:-$(sed -n 's/.*"host"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' config/db_config.json 2>/dev/null | head -n1)}}
+if [ -z "$SERVER_HOST" ]; then
+    echo "ERROR: set SERVER_HOST (or pass the server IP as arg 1)."
+    exit 1
+fi
 export SERVER_HOST
 export MACHINE_NAME=$(hostname)
 
-cd /path/to/transcript_analysis_server
 docker build -t my-client-image -f client/Dockerfile .
 
 if [ $? -eq 0 ]; then

@@ -13,7 +13,7 @@
 #
 # Usage:
 #   ./launch_fleet.sh [num_clients] [num_island_workers]
-#   SERVER_HOST=192.168.1.204 ./launch_fleet.sh        # override server ip
+#   SERVER_HOST=<server-ip> ./launch_fleet.sh           # override the task-server host
 #   SEED=1 ./launch_fleet.sh                            # ALSO seed island tasks
 #
 # Run SEED=1 on exactly ONE machine, ONE time, to populate island_task_table
@@ -22,7 +22,6 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SERVER_HOST="${SERVER_HOST:-192.168.1.204}"
 CLIENTS="${1:-$(nproc)}"          # default: one scoring client per logical CPU
 ISLANDS="${2:-1}"                 # default: 1 island worker (islands are light)
 SEED="${SEED:-0}"
@@ -30,6 +29,16 @@ HOST="$(hostname | tr -cd 'a-zA-Z0-9-')"
 
 if [ ! -f config/db_config.json ]; then
   echo "ERROR: config/db_config.json not found. Copy it onto this machine first." >&2
+  exit 1
+fi
+
+# Task-server host: use SERVER_HOST if set, otherwise the "host" from
+# config/db_config.json (the task server and DB share a machine in this setup).
+if [ -z "${SERVER_HOST:-}" ]; then
+  SERVER_HOST="$(sed -n 's/.*"host"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' config/db_config.json | head -n1)"
+fi
+if [ -z "${SERVER_HOST:-}" ]; then
+  echo "ERROR: could not determine SERVER_HOST. Set it (SERVER_HOST=<ip> ./launch_fleet.sh) or add \"host\" to config/db_config.json." >&2
   exit 1
 fi
 

@@ -176,10 +176,15 @@ class FakePool:
 
 
 def make_capturing_execute_values(pool):
-    """A drop-in for psycopg2.extras.execute_values that records the rows."""
+    """A drop-in for psycopg2.extras.execute_values. Records INSERT rows into
+    pool.store['saved'] and DELETE keys into pool.store['deleted'] so tests can
+    inspect the replace-then-insert save."""
+    pool.store.setdefault("deleted", [])
+
     def _execute_values(cur, sql, argslist, template=None, page_size=100):
+        bucket = "saved" if "insert" in sql.lower() else "deleted"
         for row in argslist:
-            pool.store["saved"].append(tuple(row))
+            pool.store[bucket].append(tuple(row))
     return _execute_values
 
 

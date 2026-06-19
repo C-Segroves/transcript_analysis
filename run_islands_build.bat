@@ -1,7 +1,7 @@
 @echo off
 echo Building Islands Runner image...
 
-cd /d "C:\Users\Chris\Desktop\git\transcript analysis\transcript_analysis_server"
+cd /d "%~dp0"
 docker build -t transcript-islands -f islands_runner\Dockerfile .
 
 if %errorlevel% neq 0 (

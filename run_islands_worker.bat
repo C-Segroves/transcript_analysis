@@ -21,7 +21,7 @@ set TOTAL_WORKERS=%~2
 shift
 shift
 
-cd /d "C:\Users\Chris\Desktop\git\transcript analysis\transcript_analysis_server"
+cd /d "%~dp0"
 echo Running islands worker %WORKER_INDEX% of %TOTAL_WORKERS%...
 docker run --rm -v "%CD%\config:/app/config" transcript-islands --worker-index %WORKER_INDEX% --total-workers %TOTAL_WORKERS% %*
 endlocal

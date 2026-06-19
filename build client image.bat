@@ -1,8 +1,15 @@
 @echo off
 echo Building Client Image...
 
-cd /d C:\Users\Chris\Desktop\git\transcript analysis\transcript_analysis_server
+cd /d "%~dp0"
 docker build -t my-client-image -f client\Dockerfile .
+
+REM Set SERVER_HOST to your task-server IP before running, e.g.:  set SERVER_HOST=your-server-ip
+if "%SERVER_HOST%"=="" (
+    echo ERROR: set SERVER_HOST to your task-server IP first ^(set SERVER_HOST=^<ip^>^).
+    pause
+    exit /b 1
+)
 
 if %errorlevel% equ 0 (
     echo Client image built successfully!
@@ -12,7 +19,7 @@ if %errorlevel% equ 0 (
     setlocal EnableDelayedExpansion
     for /f "tokens=*" %%i in ('hostname') do set HOST_NAME=%%i
     echo Hostname: !HOST_NAME!
-    docker run -it --name client-container --network transcript-network -e SERVER_HOST=192.168.1.204 -e MACHINE_NAME=!HOST_NAME! my-client-image
+    docker run -it --name client-container --network transcript-network -e SERVER_HOST=%SERVER_HOST% -e MACHINE_NAME=!HOST_NAME! my-client-image
     endlocal
 ) else (
     echo Failed to build client image. Check the output for errors.

@@ -127,6 +127,7 @@ def refresh_tasks(conn, batch_size=50000, logger=None):
                 SELECT vs.vid_id, vs.model_id
                 FROM vid_score_table vs
                 WHERE (vs.vid_id, vs.model_id) > (%s, %s)
+                  AND cardinality(vs.score) > 0
                 ORDER BY vs.vid_id, vs.model_id
                 LIMIT %s
                 """,

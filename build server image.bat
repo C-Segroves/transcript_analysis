@@ -1,7 +1,7 @@
 @echo off
 echo Building Server Image...
 
-cd /d C:\Users\Chris\Desktop\git\transcript analysis\transcript_analysis_server
+cd /d "%~dp0"
 docker build -t my-server-image -f server\Dockerfile .
 
 if %errorlevel% equ 0 (
