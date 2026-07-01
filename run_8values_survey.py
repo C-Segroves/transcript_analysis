@@ -62,6 +62,13 @@ def setup_logger():
     return logger
 
 
+_JSON_TAIL = (
+    'Reply with ONLY a single-line JSON object and nothing else:\n'
+    '{"answer": "<one of the five labels, exactly>", "confidence": <0.0-1.0>, "reason": "<15 words max>"}'
+)
+_FIVE = '  "Strongly Agree", "Agree", "Neutral/Unsure", "Disagree", "Strongly Disagree"'
+
+# --- transcript mode: infer how the speaker in the excerpts would answer -------
 DEFAULT_SYSTEM = (
     "You are a meticulous political-science research assistant doing content analysis. "
     "You infer how a speaker would respond to a statement based only on provided excerpts. "
@@ -75,22 +82,70 @@ DEFAULT_USER = (
     '"confidence": <0.0-1.0>, "reason": "<15 words max>"}'
 )
 
+# --- baseline mode: the model's OWN unprompted answer, no context --------------
+BASELINE_SYSTEM = (
+    "You are answering a political-values questionnaire as yourself. Give your own "
+    "honest assessment of each statement. You must choose exactly one of the five "
+    "allowed answers; use 'Neutral/Unsure' only when you genuinely have no lean, not "
+    "to avoid answering. Output only the requested JSON, with no preamble."
+)
+BASELINE_USER = (
+    'STATEMENT:\n"{{STATEMENT}}"\n\n'
+    'Do you agree or disagree? Choose exactly one:\n' + _FIVE + '\n\n' + _JSON_TAIL
+)
 
-def load_prompt_template():
-    """Parse the SYSTEM and USER fenced blocks out of eightvalues_prompt.md."""
+# --- probe mode: role-play a strong for/against stance, then answer ------------
+PROBE_SYSTEM = (
+    "You are role-playing a person who strongly and sincerely holds a specified "
+    "viewpoint. Answer each statement exactly as THAT person would, staying fully in "
+    "character. You must choose exactly one of the five allowed answers. Output only "
+    "the requested JSON, with no preamble."
+)
+PROBE_USER = (
+    'You strongly and sincerely hold the following position:\n"""\n{{CONTEXT}}\n"""\n\n'
+    'Staying in character as someone who holds that position, how do you respond to '
+    'this statement?\nSTATEMENT:\n"{{STATEMENT}}"\n\n'
+    'Choose exactly one:\n' + _FIVE + '\n\n' + _JSON_TAIL
+)
+
+_DEFAULTS = {
+    "transcript": (DEFAULT_SYSTEM, DEFAULT_USER),
+    "baseline": (BASELINE_SYSTEM, BASELINE_USER),
+    "probe": (PROBE_SYSTEM, PROBE_USER),
+}
+
+
+def load_prompt_templates():
+    """Return {mode_key: (system, user)} for transcript / baseline / probe.
+
+    Defaults live in code; the fenced blocks in eightvalues_prompt.md override them
+    if present: ## SYSTEM / ## USER (transcript), ## BASELINE_SYSTEM / ## BASELINE_USER,
+    ## PROBE_SYSTEM / ## PROBE_USER. probe_for and probe_against both use 'probe'.
+    """
     try:
         with open(PROMPT_PATH, "r", encoding="utf-8") as f:
             md = f.read()
     except Exception:
-        return DEFAULT_SYSTEM, DEFAULT_USER
+        return dict(_DEFAULTS)
 
     def block_after(header):
         m = re.search(re.escape(header) + r"\s*```[a-zA-Z]*\n(.*?)```", md, re.DOTALL)
         return m.group(1).strip() if m else None
 
-    system = block_after("## SYSTEM") or DEFAULT_SYSTEM
-    user = block_after("## USER") or DEFAULT_USER
-    return system, user
+    return {
+        "transcript": (block_after("## SYSTEM") or DEFAULT_SYSTEM,
+                       block_after("## USER") or DEFAULT_USER),
+        "baseline": (block_after("## BASELINE_SYSTEM") or BASELINE_SYSTEM,
+                     block_after("## BASELINE_USER") or BASELINE_USER),
+        "probe": (block_after("## PROBE_SYSTEM") or PROBE_SYSTEM,
+                  block_after("## PROBE_USER") or PROBE_USER),
+    }
+
+
+def template_for_mode(templates, mode):
+    """probe_for / probe_against share the 'probe' template."""
+    key = "probe" if mode in ("probe_for", "probe_against") else mode
+    return templates.get(key, templates["transcript"])
 
 
 # ---------------------------------------------------------------------------
@@ -355,8 +410,9 @@ def store_score(conn, run_id, pct, raw, maxv, answered, failed):
         )
 
 
-def process_run(conn, run, questions, by_label, by_order, system_tmpl, user_tmpl,
+def process_run(conn, run, questions, by_label, by_order, templates,
                 max_retries, qvec_cache, logger):
+    system_tmpl, user_tmpl = template_for_mode(templates, run["mode"])
     multipliers = {}
     failed = 0
     for q in questions:
@@ -458,7 +514,7 @@ def cmd_work(args, logger):
     try:
         questions = load_questions(conn)
         by_label, by_order = load_answer_options(conn)
-        system_tmpl, user_tmpl = load_prompt_template()
+        templates = load_prompt_templates()
         qvec_cache = {}
         processed = 0
         while True:
@@ -472,7 +528,7 @@ def cmd_work(args, logger):
                         run["id"], run["mode"], run["vid_id"], run["llm_model"], run["repeat_index"])
             try:
                 failed, pct = process_run(conn, run, questions, by_label, by_order,
-                                          system_tmpl, user_tmpl, args.max_retries, qvec_cache, logger)
+                                          templates, args.max_retries, qvec_cache, logger)
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE eightvalues_run SET status='done', failed_count=%s, error=NULL, updated_at=now() WHERE id=%s",
