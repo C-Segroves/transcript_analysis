@@ -344,12 +344,14 @@ def render_workers_section(snapshot):
     total = snapshot.get("total_models", 0) or 0
     completed = snapshot.get("completed_models", 0) or 0
     busy = snapshot.get("busy_models", 0) or 0
-    pct = f"{(completed / total) * 100:.1f}%" if total else "—"
     cards = [
         ("Active workers", snapshot.get("active_clients"), f"server: {_esc(snapshot.get('server_state', '?'))}"),
-        ("Models complete", completed, f"{pct} of {_fmt(total)}"),
-        ("Models in progress", busy, "currently owned by a worker"),
-        ("Models idle", max(total - completed - busy, 0), "available to assign"),
+        # NOTE: this is a live, in-memory count of models drained THIS server
+        # session -- it resets on every server restart and nightly maintenance.
+        # It is NOT overall progress; see the "Scoring progress" card for that.
+        ("Models done (session)", completed, "resets on restart / nightly"),
+        ("Models in progress", busy, "owned by a worker right now"),
+        ("Models being worked", busy + completed, f"of {_fmt(total)} this session"),
     ]
     card_html = "\n".join(
         f"""

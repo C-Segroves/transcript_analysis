@@ -38,6 +38,10 @@ nano config/db_config.json          # paste the DB config (see below)
 chmod +x launch_fleet.sh
 sed -i 's/\r$//' launch_fleet.sh     # strip CRLF in case it was committed from Windows
 ./launch_fleet.sh                    # 1 scoring client per CPU + 1 island worker
+
+
+docker ps
+docker logs -f $(hostname)-client-1
 ```
 
 That's it. The machine starts contributing within a minute (it may sit in
