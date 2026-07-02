@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS eightvalues_response (
     raw_output       TEXT,                  -- final raw LLM text
     all_outputs      TEXT,                  -- JSON array of every attempt's raw text (TEXT, not
                                             -- JSONB: the DB is SQL_ASCII and JSONB rejects the
-                                            -- non-ASCII \u escapes models sometimes emit)
+                                            -- non-ASCII unicode escapes models sometimes emit)
     insert_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (run_id, question_id)
 );
@@ -172,7 +172,7 @@ ALTER TABLE eightvalues_probe_statement ADD COLUMN IF NOT EXISTS variant VARCHAR
 ALTER TABLE eightvalues_run           ADD COLUMN IF NOT EXISTS probe_variant VARCHAR(16);
 
 -- all_outputs must be TEXT, not JSONB: this DB is SQL_ASCII and JSONB rejects the
--- non-ASCII \u escapes models sometimes emit. Convert if it's still JSONB.
+-- non-ASCII unicode escapes models sometimes emit. Convert if it's still JSONB.
 ALTER TABLE eightvalues_response ALTER COLUMN all_outputs TYPE TEXT USING all_outputs::text;
 
 -- Drop the pre-variant UNIQUE (question_id, direction) if it still exists, so the
