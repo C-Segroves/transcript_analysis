@@ -288,11 +288,12 @@ def get_vid_chunks(conn, vid_id):
         return cur.fetchall()
 
 
-def get_probe_statement(conn, question_id, direction):
+def get_probe_statement(conn, question_id, direction, variant):
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT statement_text FROM eightvalues_probe_statement WHERE question_id = %s AND direction = %s",
-            (question_id, direction),
+            "SELECT statement_text FROM eightvalues_probe_statement "
+            "WHERE question_id = %s AND direction = %s AND variant = %s",
+            (question_id, direction, variant),
         )
         row = cur.fetchone()
         return row[0] if row else ""
@@ -331,10 +332,11 @@ def build_context(conn, run, question, qvec_cache, logger):
     mode = run["mode"]
     if mode == "baseline":
         return ""
+    variant = run.get("probe_variant") or "verbose"
     if mode == "probe_for":
-        return get_probe_statement(conn, question["id"], "for")
+        return get_probe_statement(conn, question["id"], "for", variant)
     if mode == "probe_against":
-        return get_probe_statement(conn, question["id"], "against")
+        return get_probe_statement(conn, question["id"], "against", variant)
     # transcript: retrieve top-k chunks for this video by similarity to the question
     chunks = get_vid_chunks(conn, run["vid_id"])
     if not chunks:
@@ -446,7 +448,7 @@ WITH claimed AS (
 UPDATE eightvalues_run r
 SET status = 'in_progress', attempts = r.attempts + 1, claimed_at = now(), updated_at = now()
 FROM claimed WHERE r.id = claimed.id
-RETURNING r.id, r.mode, r.vid_id, r.llm_model, r.repeat_index, r.top_k, r.temperature;
+RETURNING r.id, r.mode, r.vid_id, r.llm_model, r.repeat_index, r.top_k, r.temperature, r.probe_variant;
 """
 
 
@@ -458,14 +460,17 @@ def claim_run(conn, max_attempts):
     if not row:
         return None
     return {"id": row[0], "mode": row[1], "vid_id": row[2], "llm_model": row[3],
-            "repeat_index": row[4], "top_k": row[5], "temperature": row[6]}
+            "repeat_index": row[4], "top_k": row[5], "temperature": row[6],
+            "probe_variant": row[7]}
 
 
-def seed_runs(conn, mode, channel, models, repeats, top_k, temperature, logger):
-    """Create pending eightvalues_run rows."""
+def seed_runs(conn, mode, channel, models, repeats, top_k, temperature, probe_variant, logger):
+    """Create pending eightvalues_run rows. probe_variant tags probe runs only."""
     modes = ["baseline", "probe_for", "probe_against"] if mode == "calibration" else [mode]
     total = 0
     for m in modes:
+        # Only probe runs carry a variant; baseline/transcript leave it NULL.
+        pv = probe_variant if m in ("probe_for", "probe_against") else None
         if m == "transcript":
             # one run per (video with chunks) x model x repeat
             where = ["EXISTS (SELECT 1 FROM transcript_chunk_table tc WHERE tc.vid_id = v.id)"]
@@ -476,22 +481,24 @@ def seed_runs(conn, mode, channel, models, repeats, top_k, temperature, logger):
             with conn.cursor() as cur:
                 cur.execute(f"SELECT v.id FROM vid_table v WHERE {' AND '.join(where)} ORDER BY v.id", params)
                 vids = [r[0] for r in cur.fetchall()]
-            rows = [(m, vid, model, rep, top_k, temperature)
+            rows = [(m, vid, model, rep, top_k, temperature, pv)
                     for vid in vids for model in models for rep in range(1, repeats + 1)]
         else:
             # baseline / probe: per model x repeat, no video
-            rows = [(m, None, model, rep, top_k, temperature)
+            rows = [(m, None, model, rep, top_k, temperature, pv)
                     for model in models for rep in range(1, repeats + 1)]
         if rows:
             with conn.cursor() as cur:
                 execute_values(
                     cur,
-                    "INSERT INTO eightvalues_run (mode, vid_id, llm_model, repeat_index, top_k, temperature) "
-                    "VALUES %s ON CONFLICT (mode, COALESCE(vid_id, -1), llm_model, repeat_index) DO NOTHING",
+                    "INSERT INTO eightvalues_run "
+                    "(mode, vid_id, llm_model, repeat_index, top_k, temperature, probe_variant) "
+                    "VALUES %s ON CONFLICT (mode, COALESCE(vid_id, -1), llm_model, repeat_index, "
+                    "COALESCE(probe_variant, '')) DO NOTHING",
                     rows,
                 )
             conn.commit()
-        logger.info("Seeded %d %s run(s).", len(rows), m)
+        logger.info("Seeded %d %s run(s)%s.", len(rows), m, f" [{pv}]" if pv else "")
         total += len(rows)
     return total
 
@@ -504,7 +511,8 @@ def cmd_seed(args, logger):
     conn = psycopg2.connect(**load_db_config())
     try:
         models = [m.strip() for m in args.models.split(",") if m.strip()]
-        seed_runs(conn, args.mode, args.channel, models, args.repeats, args.top_k, args.temperature, logger)
+        seed_runs(conn, args.mode, args.channel, models, args.repeats, args.top_k,
+                  args.temperature, args.probe_variant, logger)
     finally:
         conn.close()
 
@@ -562,6 +570,8 @@ def main():
     s.add_argument("--repeats", type=int, default=1, help="Repeats per subject")
     s.add_argument("--top-k", type=int, default=6, help="Chunks retrieved per question (transcript mode)")
     s.add_argument("--temperature", type=float, default=0.0)
+    s.add_argument("--probe-variant", choices=["verbose", "succinct"], default="verbose",
+                   help="Which probe statement set to use for probe_for/probe_against")
 
     w = sub.add_parser("work", help="Claim and process pending runs.")
     w.add_argument("--once", action="store_true", help="Drain the queue then exit")
