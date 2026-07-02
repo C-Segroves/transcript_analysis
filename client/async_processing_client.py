@@ -72,6 +72,12 @@ def load_config():
 
 
 DB_CONFIG = load_config()
+# The scoring containers frequently run a C/POSIX locale, which makes psycopg2
+# default to an ASCII client encoding. Then any transcript containing non-ASCII
+# bytes (smart quotes, accents, em-dashes -- byte 0xc2 etc.) raises
+# UnicodeDecodeError in fetchall() and kills the worker. Force UTF-8 on every
+# pooled connection so all transcript text decodes correctly.
+DB_CONFIG.setdefault("client_encoding", "UTF8")
 
 
 def setup_logger(log_file_path):
