@@ -177,15 +177,53 @@ def score_transcript_items(model, transcript_items):
 # DB access (all called via asyncio.to_thread so the event loop stays responsive)
 # ---------------------------------------------------------------------------
 
+def _db_execute(db_pool, logger, fn, what, retries=4):
+    """Run fn(conn) with a pooled connection and commit.
+
+    If the connection is dead (server restart, terminated backend, network blip),
+    psycopg2 raises OperationalError/InterfaceError. We DISCARD that broken
+    connection (putconn close=True) so the pool never hands it out again, then
+    retry with a fresh one. Raises the last error if all retries fail -- callers
+    (the worker loop) treat that as "retry the whole cycle" rather than dying.
+    """
+    last_err = None
+    for attempt in range(1, retries + 1):
+        conn = db_pool.getconn()
+        broken = False
+        try:
+            result = fn(conn)
+            conn.commit()
+            return result
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            broken = True                       # connection is dead -> drop it
+            last_err = e
+            logger.warning(f"{what}: DB connection lost ({e}); "
+                           f"discarding it, retry {attempt}/{retries}.")
+            time.sleep(min(2 * attempt, 10))
+        except psycopg2.Error as e:             # a real query/data error, not the socket
+            last_err = e
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"{what}: DB error: {e}")
+            raise
+        finally:
+            try:
+                db_pool.putconn(conn, close=broken)
+            except Exception:
+                pass
+    logger.error(f"{what}: giving up after {retries} attempts.")
+    raise last_err
+
+
 def db_get_pending_video_ids(db_pool, model_id, logger):
     """Internal vid_table.id of every video whose transcript lacks a score for model_id."""
-    conn = db_pool.getconn()
-    try:
+    def _fn(conn):
         with conn.cursor() as cur:
-            # EXISTS/NOT EXISTS (semi-joins) instead of JOIN+GROUP BY so the planner
-            # can satisfy this with index probes: one per video against the
-            # transcript index and the (vid_id, model_id) score index, rather than
-            # scanning the whole transcript/score tables.
+            # EXISTS/NOT EXISTS (semi-joins) so the planner can satisfy this with
+            # index probes (idx_vid_transcript_real, idx_vid_score_model_real)
+            # rather than scanning the whole transcript/score tables.
             cur.execute("""
                 SELECT v.id
                 FROM vid_table v
@@ -201,17 +239,11 @@ def db_get_pending_video_ids(db_pool, model_id, logger):
                 ORDER BY v.id
             """, (model_id,))
             return [r[0] for r in cur.fetchall()]
-    except psycopg2.Error as e:
-        logger.error(f"Error fetching pending videos for model {model_id}: {e}")
-        conn.rollback()
-        return []
-    finally:
-        db_pool.putconn(conn)
+    return _db_execute(db_pool, logger, _fn, f"pending videos (model {model_id})")
 
 
 def db_get_transcript_text(db_pool, vid_id, logger):
-    conn = db_pool.getconn()
-    try:
+    def _fn(conn):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT text FROM vid_transcript_table
@@ -219,21 +251,16 @@ def db_get_transcript_text(db_pool, vid_id, logger):
                 ORDER BY cum_word_count
             """, (vid_id,))
             return ' '.join(str(r[0]) for r in cur.fetchall())
-    except psycopg2.Error as e:
-        logger.error(f"Error fetching transcript for vid {vid_id}: {e}")
-        conn.rollback()
-        return ""
-    finally:
-        db_pool.putconn(conn)
+    return _db_execute(db_pool, logger, _fn, f"transcript (vid {vid_id})")
 
 
 def db_load_models(db_pool, model_ids, logger):
     """Return {model_id: model_object} for the given ids, unpickled from model_table."""
-    loaded = {}
     if not model_ids:
-        return loaded
-    conn = db_pool.getconn()
-    try:
+        return {}
+
+    def _fn(conn):
+        loaded = {}
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, yt_model_key, model_data FROM model_table WHERE id = ANY(%s)",
@@ -251,20 +278,15 @@ def db_load_models(db_pool, model_ids, logger):
             except Exception as e:
                 logger.error(f"Failed to unpickle model {model_id} ({yt_model_key}): {e}")
         return loaded
-    except psycopg2.Error as e:
-        logger.error(f"DB error loading models {list(model_ids)}: {e}")
-        conn.rollback()
-        return loaded
-    finally:
-        db_pool.putconn(conn)
+    return _db_execute(db_pool, logger, _fn, f"load models {list(model_ids)}")
 
 
 def db_save_scores(db_pool, rows, logger):
-    """rows: list of (vid_id, model_id, score_list). One batched upsert."""
+    """rows: list of (vid_id, model_id, score_list). Delete-then-insert per pair."""
     if not rows:
         return 0
-    conn = db_pool.getconn()
-    try:
+
+    def _fn(conn):
         with conn.cursor() as cur:
             # vid_score_table has no unique key, so we can't upsert. Delete any
             # existing rows for these (vid_id, model_id) pairs first, then insert.
@@ -281,14 +303,8 @@ def db_save_scores(db_pool, rows, logger):
                 VALUES %s
             """, [(vid_id, model_id, score) for (vid_id, model_id, score) in rows],
                 template="(%s, %s, %s, CURRENT_TIMESTAMP)")
-        conn.commit()
         return len(rows)
-    except psycopg2.Error as e:
-        logger.error(f"DB error saving {len(rows)} score row(s): {e}")
-        conn.rollback()
-        return 0
-    finally:
-        db_pool.putconn(conn)
+    return _db_execute(db_pool, logger, _fn, f"save {len(rows)} score row(s)")
 
 
 # ---------------------------------------------------------------------------
@@ -424,19 +440,27 @@ class ProcessingClient(BaseClient):
     async def worker_loop(self):
         self.logger.info("Worker loop started.")
         while self.client_state == 'play':
-            model_id = await self.request_model()
-            if model_id is None:
-                self.logger.info(f"No work available; retrying in {NO_WORK_POLL_SECONDS}s.")
-                await asyncio.sleep(NO_WORK_POLL_SECONDS)
-                continue
-            scored = await self.process_model(model_id)
-            if self.client_state != 'play':
-                # Paused before finishing: keep the model (server still owns it for us);
-                # we'll resume it on the next play.
-                break
-            await self.send_data(generate_model_complete_packet(model_id, scored))
-            self.logger.info(f"Model {model_id} done (+{scored}, total {self.total_scored}).")
-            await asyncio.sleep(0.05)
+            try:
+                model_id = await self.request_model()
+                if model_id is None:
+                    self.logger.info(f"No work available; retrying in {NO_WORK_POLL_SECONDS}s.")
+                    await asyncio.sleep(NO_WORK_POLL_SECONDS)
+                    continue
+                scored = await self.process_model(model_id)
+                if self.client_state != 'play':
+                    # Paused before finishing: keep the model (server still owns it for
+                    # us); we'll resume it on the next play.
+                    break
+                await self.send_data(generate_model_complete_packet(model_id, scored))
+                self.logger.info(f"Model {model_id} done (+{scored}, total {self.total_scored}).")
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                # Never let a transient failure (dropped DB connection, etc.) kill the
+                # loop -- log it, pause briefly, and retry the whole cycle. The DB layer
+                # has already discarded any broken connection, so the next attempt gets
+                # a fresh one. We do NOT report the model complete on error.
+                self.logger.error(f"Worker loop error: {e}; recovering in 5s.")
+                await asyncio.sleep(5)
         self.logger.info("Worker loop exiting (paused/stopped).")
 
     # ----- lifecycle -----
