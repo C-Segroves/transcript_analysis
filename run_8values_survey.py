@@ -384,7 +384,8 @@ def store_response(conn, run_id, question_id, res):
                 raw_output = EXCLUDED.raw_output, all_outputs = EXCLUDED.all_outputs
             """,
             (run_id, question_id, res["option_id"], res["failed"], res["attempts"],
-             res["confidence"], res["reason"], res["raw"], Json(res["all_outputs"])),
+             res["confidence"], res["reason"], res["raw"],
+             json.dumps(res["all_outputs"], ensure_ascii=False)),
         )
 
 
